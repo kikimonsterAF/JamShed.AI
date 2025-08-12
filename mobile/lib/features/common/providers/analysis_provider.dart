@@ -16,6 +16,13 @@ class ScaleSuggestionModel {
   });
 }
 
+class SectionSummaryModel {
+  final String label;
+  final List<String> chords;
+  final List<String> romanChords;
+  SectionSummaryModel({required this.label, required this.chords, required this.romanChords});
+}
+
 class AnalysisResult {
   final List<String> chords;
   final List<String> form;
@@ -23,7 +30,8 @@ class AnalysisResult {
   final String? localFilePath;
   final int? beatsPerBar;
   final String? meter;
-  AnalysisResult({required this.chords, required this.form, required this.scales, this.localFilePath, this.beatsPerBar, this.meter});
+  final List<SectionSummaryModel> sections;
+  AnalysisResult({required this.chords, required this.form, required this.scales, this.localFilePath, this.beatsPerBar, this.meter, this.sections = const []});
 }
 
 class AnalysisNotifier extends StateNotifier<AsyncValue<AnalysisResult?>> {
@@ -59,6 +67,12 @@ class AnalysisNotifier extends StateNotifier<AsyncValue<AnalysisResult?>> {
                   recommendedScales: ((m['recommended_scales'] as List?) ?? []).map((x) => x.toString()).toList(),
                 ))
             .toList();
+        final sectionJson = (body['section_summaries'] as List? ?? []) as List;
+        final sections = sectionJson.map((e) => e as Map<String, dynamic>).map((m) => SectionSummaryModel(
+          label: (m['label'] ?? '').toString(),
+          chords: ((m['chords'] as List?) ?? []).map((x) => x.toString()).toList(),
+          romanChords: ((m['roman_chords'] as List?) ?? []).map((x) => x.toString()).toList(),
+        )).toList();
         state = AsyncData(AnalysisResult(
           chords: chords,
           form: form,
@@ -66,6 +80,7 @@ class AnalysisNotifier extends StateNotifier<AsyncValue<AnalysisResult?>> {
           localFilePath: filePath,
           beatsPerBar: (body['beats_per_bar'] as int?),
           meter: body['meter'] as String?,
+          sections: sections,
         ));
       } else {
         state = AsyncError('Server error: ${res.statusCode}: ${res.body}', StackTrace.current);
@@ -103,6 +118,12 @@ class AnalysisNotifier extends StateNotifier<AsyncValue<AnalysisResult?>> {
                   recommendedScales: ((m['recommended_scales'] as List?) ?? []).map((x) => x.toString()).toList(),
                 ))
             .toList();
+        final sectionJson = (body['section_summaries'] as List? ?? []) as List;
+        final sections = sectionJson.map((e) => e as Map<String, dynamic>).map((m) => SectionSummaryModel(
+          label: (m['label'] ?? '').toString(),
+          chords: ((m['chords'] as List?) ?? []).map((x) => x.toString()).toList(),
+          romanChords: ((m['roman_chords'] as List?) ?? []).map((x) => x.toString()).toList(),
+        )).toList();
         state = AsyncData(AnalysisResult(
           chords: chords,
           form: form,
@@ -110,6 +131,7 @@ class AnalysisNotifier extends StateNotifier<AsyncValue<AnalysisResult?>> {
           localFilePath: null,
           beatsPerBar: (body['beats_per_bar'] as int?),
           meter: body['meter'] as String?,
+          sections: sections,
         ));
       } else {
         state = AsyncError('Server error: ${res.statusCode}: ${res.body}', StackTrace.current);

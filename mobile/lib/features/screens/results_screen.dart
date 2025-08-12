@@ -46,7 +46,7 @@ class ResultsScreen extends ConsumerWidget {
                 data: (data) => TabBarView(
                   children: [
                     Center(child: Text('Tab view placeholder')),
-                    Padding(
+                     Padding(
                       padding: const EdgeInsets.all(16),
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
@@ -59,10 +59,23 @@ class ResultsScreen extends ConsumerWidget {
                               ],
                             ),
                           const SizedBox(height: 12),
-                           Text(
-                             data == null ? '—' : data.chords.join('  '),
-                            style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w600),
-                          ),
+                           if (data != null && data.sections.isNotEmpty)
+                             Column(
+                               crossAxisAlignment: CrossAxisAlignment.start,
+                               children: [
+                                 for (final sec in data.sections) ...[
+                                   Text('${sec.label} section', style: const TextStyle(fontWeight: FontWeight.w700)),
+                                   const SizedBox(height: 4),
+                                   Text(sec.chords.join('  ')),
+                                   const SizedBox(height: 12),
+                                 ],
+                               ],
+                             )
+                           else
+                             Text(
+                               data == null ? '—' : data.chords.join('  '),
+                               style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w600),
+                             ),
                         ],
                       ),
                     ),
