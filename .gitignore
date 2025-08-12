@@ -1,0 +1,9 @@
+
+# Ignore Python/venv and Flutter build
+server/.venv/
+**/.DS_Store
+**/.idea/
+**/.vscode/
+mobile/build/
+**/.dart_tool/
+**/build/

@@ -114,6 +114,8 @@ Frontend: React Native / Flutter.
 
 Backend: Node.js or Python (FastAPI) + AWS/GCP.
 
+Analysis: Server-side only for MVP (no on-device processing). Mobile always uploads media to backend for analysis.
+
 AI Models:
 
 Whisper or equivalent for transcription.
