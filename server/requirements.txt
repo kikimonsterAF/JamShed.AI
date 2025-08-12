@@ -10,4 +10,5 @@ numpy==1.26.4
 scipy==1.11.4
 soundfile==0.12.1
 ffmpeg-python==0.2.0
+yt-dlp
 

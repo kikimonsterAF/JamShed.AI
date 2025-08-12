@@ -14,6 +14,7 @@ Health check: `GET http://localhost:8080/health`
 ## Endpoints
 - `GET /usage` — returns entitlement/quota
 - `POST /analyze` — upload audio/video file; returns chords, form, and scale suggestions
+- `POST /analyze_url` — form field `url` (YouTube or other) → downloads audio with yt-dlp and analyzes
 
 ## Dependencies
 
@@ -27,6 +28,7 @@ This service uses FFmpeg for robust media decoding and librosa/scipy for audio a
   - Linux (Debian/Ubuntu): `sudo apt update; sudo apt install -y ffmpeg`
 
 - Python packages are listed in `requirements.txt` (includes `librosa`, `soundfile`, `scipy`, `numpy`).
+  - For URL analysis, install `yt-dlp` (already in requirements). Some sites may require `ffmpeg` for postprocessing.
 
 ## Architecture Note
 
