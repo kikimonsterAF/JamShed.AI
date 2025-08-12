@@ -39,6 +39,7 @@ dependencies:
   just_audio: ^0.10.4
   video_player: ^2.10.0
   purchases_flutter: ^9.2.0
+  http: ^1.5.0
 
 dev_dependencies:
   flutter_test:
