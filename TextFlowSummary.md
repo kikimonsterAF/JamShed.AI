@@ -7,7 +7,8 @@ Onboarding → Home Dashboard
                     ↳ Chord Progression View (with Song Form Row)
                     ↳ Strumming Pattern View
                      ↳ Scale Suggestions View
-                        → Practice Tools
+                         → Practice Tools
+                             ↳ Key Transpose Control (±12 semitones)
                             → Solo Breakdown Mode
                                 → Save/Share
                                     → Library

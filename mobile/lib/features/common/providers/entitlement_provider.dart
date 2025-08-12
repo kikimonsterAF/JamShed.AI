@@ -1,4 +1,7 @@
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:http/http.dart' as http;
+import 'dart:convert';
+import '../../../core/config.dart';
 
 class EntitlementState {
   final bool isSubscribed;
@@ -32,6 +35,23 @@ class EntitlementNotifier extends StateNotifier<EntitlementState> {
 
   void setSubscribed(bool value) {
     state = state.copyWith(isSubscribed: value);
+  }
+
+  Future<void> refreshFromServer() async {
+    try {
+      final uri = Uri.parse('${AppConfig.apiBaseUrl}/usage');
+      final res = await http.get(uri).timeout(const Duration(seconds: 5));
+      if (res.statusCode == 200) {
+        final body = json.decode(res.body) as Map<String, dynamic>;
+        state = state.copyWith(
+          isSubscribed: body['is_subscribed'] as bool? ?? false,
+          transcriptionsUsed: body['transcriptions_used'] as int? ?? 0,
+          freeQuota: body['free_quota'] as int? ?? 5,
+        );
+      }
+    } catch (_) {
+      // Leave local state on network error
+    }
   }
 }
 

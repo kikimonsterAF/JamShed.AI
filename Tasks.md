@@ -76,6 +76,12 @@ Scale Suggestions Module (NEW)
 - Instrument-aware: translate to fretboard positions per tuning.
 - JSON schema: per-section and per-chord recommendations with timestamps.
 
+Key Transpose Module (NEW)
+- Implement pitch-shift pipeline (±12 semitones) with formant preservation where possible.
+- Transpose chord progression, Tennessee numbers, and tab output based on selected semitone shift.
+- Capo/key recomputation after transposition for string instruments.
+- Expose transpose parameter in analysis/practice endpoints and persist in session state.
+
 Monetization & Entitlements
 - Database: add `subscription_status`, `transcriptions_used`, `last_reset_at`.
 - Quota enforcement middleware on transcription endpoints.
@@ -152,6 +158,11 @@ Loop start/end selection.
 Chunk practice mode.
 
 Reverse playback toggle.
+
+Key Transpose UI
+- Add transpose control (semitone stepper or wheel) in Practice Tools.
+- Reflect transposed key/chords/tab in Results views.
+- Display capo suggestions after transposition.
 
 Solo Breakdown Mode
 Phrase list view with play/loop/reverse buttons.

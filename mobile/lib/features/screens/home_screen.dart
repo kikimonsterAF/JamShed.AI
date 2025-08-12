@@ -10,6 +10,7 @@ class HomeScreen extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final entitlement = ref.watch(entitlementProvider);
+    ref.read(entitlementProvider.notifier).refreshFromServer();
     return Scaffold(
       appBar: AppBar(title: const Text('Home')),
       body: Padding(

@@ -86,6 +86,15 @@ Suggest scales per chord and per song section to guide improvisation.
 - Playback sync: highlight current section’s recommended scale and target tones as audio plays.
 - Output: JSON with per-section and per-chord `key_center`, `recommended_scales`, `scale_degrees`, and `target_notes`.
 
+4.10 Key Transpose While Practicing (NEW)
+Allow users to change the playback key without re-uploading, for comfortable singing/playing and exploring tonalities.
+
+- Real-time or near-real-time pitch shift of audio/video by ±12 semitones.
+- Auto-transpose displayed chords, Tennessee numbers, and tablature to the selected key.
+- Show capo suggestion for string instruments after transposition.
+- Preserve tempo (independent of existing slow-down feature).
+- Output/state: include `transpose_semitones` in session/practice settings and return transposed chord chart/tab.
+
 5. Non-Functional Requirements
 <30s transcription latency for 30s clip.
 
