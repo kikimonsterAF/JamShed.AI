@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from pydantic import BaseModel
 from typing import List, Optional, Tuple
 from mutagen import File as MutagenFile
@@ -9,6 +9,8 @@ import os
 import numpy as np
 import soundfile as sf
 import librosa
+import uuid
+from tempfile import TemporaryDirectory
 
 app = FastAPI(title="JamTab API", version="0.1.0")
 
@@ -26,6 +28,9 @@ class AnalysisResponse(BaseModel):
     chords: List[str]
     form: List[str]
     scale_suggestions: List[ScaleSuggestion]
+    # Estimated meter information (auto or user-provided override echoed back)
+    beats_per_bar: Optional[int] = None
+    meter: Optional[str] = None
 
 
 class UsageResponse(BaseModel):
@@ -50,6 +55,8 @@ async def analyze(
     file: UploadFile = File(...),
     instrument: Optional[str] = None,
     difficulty: Optional[str] = None,
+    beats_per_bar: Optional[int] = None,
+    meter: Optional[str] = None,
 ) -> AnalysisResponse:
     allowed_types = {
         "audio/mpeg",  # .mp3
@@ -79,36 +86,152 @@ async def analyze(
         shutil.copyfileobj(file.file, tmp)
         src_path = tmp.name
     try:
-        mf = MutagenFile(src_path)
-        _ = float(getattr(mf.info, "length", 0.0) or 0.0)  # duration if available (not currently returned)
-    except Exception:
-        pass
+        # Echo duration if available (non-critical)
+        try:
+            mf = MutagenFile(src_path)
+            _ = float(getattr(mf.info, "length", 0.0) or 0.0)
+        except Exception:
+            pass
+        # Delegate to path-based analyzer
+        result = _analyze_path(
+            src_path=src_path,
+            instrument=instrument,
+            difficulty=difficulty,
+            beats_per_bar=beats_per_bar,
+            meter=meter,
+        )
+        return result
     finally:
         try:
             file.file.close()
         except Exception:
             pass
+        try:
+            os.remove(src_path)
+        except Exception:
+            pass
 
+
+@app.post("/analyze_url", response_model=AnalysisResponse)
+async def analyze_url(
+    url: str = Form(...),
+    instrument: Optional[str] = None,
+    difficulty: Optional[str] = None,
+    beats_per_bar: Optional[int] = None,
+    meter: Optional[str] = None,
+) -> AnalysisResponse:
+    """Download audio from YouTube (or other supported sites) and analyze it.
+    Requires yt-dlp and ffmpeg to be present.
+    """
+    try:
+        import yt_dlp  # type: ignore
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"yt-dlp not installed: {e}")
+
+    with TemporaryDirectory() as tmpdir:
+        out_base = os.path.join(tmpdir, str(uuid.uuid4()))
+        out_path = f"{out_base}.mp3"
+        # Resolve ffmpeg/ffprobe location for yt-dlp (accept either the binary path or its parent directory)
+        ffbin = os.environ.get("FFMPEG_BIN")
+        ffmpeg_location = None
+        if ffbin:
+            ffmpeg_location = os.path.dirname(ffbin) if ffbin.lower().endswith("ffmpeg.exe") or ffbin.lower().endswith("ffmpeg") else ffbin
+        ydl_opts = {
+            "format": "bestaudio/best",
+            "outtmpl": out_base,
+            "postprocessors": [
+                {
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "mp3",
+                    "preferredquality": "0",
+                }
+            ],
+            "quiet": True,
+            "nocheckcertificate": True,
+        }
+        if ffmpeg_location:
+            ydl_opts["ffmpeg_location"] = ffmpeg_location
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Failed to download media: {e}")
+
+        # Reuse the same analysis pipeline by opening the file as if it was uploaded
+        # Determine actual downloaded audio file path
+        candidate_path = out_path if os.path.exists(out_path) else None
+        if candidate_path is None:
+            # Fallback: search temp dir for common audio extensions, pick largest file
+            exts = (".m4a", ".mp3", ".ogg", ".opus", ".webm", ".wav", ".mka")
+            candidates = []
+            for root, _, files in os.walk(tmpdir):
+                for fn in files:
+                    if os.path.splitext(fn)[1].lower() in exts:
+                        fp = os.path.join(root, fn)
+                        try:
+                            size = os.path.getsize(fp)
+                        except Exception:
+                            size = 0
+                        candidates.append((size, fp))
+            if candidates:
+                candidates.sort(reverse=True)
+                candidate_path = candidates[0][1]
+        if not candidate_path or not os.path.exists(candidate_path):
+            raise HTTPException(status_code=400, detail="Downloaded file not found. Check ffmpeg/yt-dlp postprocessing.")
+        # Directly analyze the downloaded audio path
+        return _analyze_path(
+            src_path=candidate_path,
+            instrument=instrument,
+            difficulty=difficulty,
+            beats_per_bar=beats_per_bar,
+            meter=meter,
+        )
+
+
+def _analyze_path(
+    src_path: str,
+    instrument: Optional[str],
+    difficulty: Optional[str],
+    beats_per_bar: Optional[int],
+    meter: Optional[str],
+) -> AnalysisResponse:
     # Decode to mono PCM WAV (22.05 kHz) via ffmpeg
     y, sr = _decode_audio_with_ffmpeg(src_path, target_sr=22050)
     if y.size == 0:
-        raise HTTPException(status_code=400, detail="Failed to decode audio. Ensure FFmpeg is installed and the file is valid.")
+        try:
+            size = os.path.getsize(src_path)
+        except Exception:
+            size = -1
+        raise HTTPException(status_code=400, detail=f"Failed to decode audio (path={src_path}, size={size}). Ensure FFmpeg/ffprobe are available and the media is valid.")
 
     # Chroma features and beat-synchronous pooling
     chroma, beat_frames = _compute_beatsynced_chroma(y, sr)
 
-    # Key estimation using Krumhansl-Schmuckler profiles
+    # Key estimation
     key_center, key_mode = _estimate_key_from_chroma(chroma)
 
-    # Chord sequence (major/minor triads) per beat block; collapse repeats for readability
+    # Chords and collapsed progression
     beat_chords = _infer_chords_from_chroma(chroma)
     chords_progression = _collapse_repeats(beat_chords)
 
-    # Simple form detection: chunk progression into 4-chord phrases, label repeats as A/B/C
-    form_labels = _infer_form_from_chords(beat_chords)
+    # Select phrase length (user override or auto)
+    user_bpb: Optional[int] = None
+    if beats_per_bar and beats_per_bar > 0:
+        user_bpb = int(beats_per_bar)
+    elif isinstance(meter, str) and "/" in meter:
+        try:
+            num = int(meter.split("/", 1)[0].strip())
+            if num > 0:
+                user_bpb = num
+        except Exception:
+            user_bpb = None
+    selected_bpb = user_bpb or _select_phrase_len(beat_chords)
 
-    # Scale suggestions (basic): key minor pentatonic and Mixolydian per chord root
-    unique_chords = list(dict.fromkeys(chords_progression))[:8]  # limit to first few unique for response brevity
+    # Form labels
+    form_labels = _infer_form_from_chords(beat_chords, phrase_len=selected_bpb)
+
+    # Scale suggestions
+    unique_chords = list(dict.fromkeys(chords_progression))[:8]
     suggestions: List[ScaleSuggestion] = []
     for idx, chord in enumerate(unique_chords):
         root = chord.rstrip("m").upper()
@@ -125,13 +248,14 @@ async def analyze(
             )
         )
 
-    # Cleanup temp file
-    try:
-        os.remove(src_path)
-    except Exception:
-        pass
-
-    return AnalysisResponse(chords=chords_progression[:16], form=form_labels[:8], scale_suggestions=suggestions)
+    meter_label = f"{selected_bpb}/4" if selected_bpb else None
+    return AnalysisResponse(
+        chords=chords_progression[:16],
+        form=form_labels[:8],
+        scale_suggestions=suggestions,
+        beats_per_bar=selected_bpb,
+        meter=meter_label,
+    )
 
 
 # ---------- Analysis helpers ----------
@@ -140,12 +264,15 @@ _NOTE_NAMES_SHARP = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#",
 
 
 def _decode_audio_with_ffmpeg(src_path: str, target_sr: int = 22050) -> Tuple[np.ndarray, int]:
-    """Decode arbitrary media to mono float32 PCM at target_sr using ffmpeg CLI. Falls back to librosa/soundfile on failure."""
+    """Decode arbitrary media to mono float32 PCM at target_sr using ffmpeg CLI.
+    Resolves ffmpeg from env var FFMPEG_BIN if provided. Falls back to librosa/soundfile on failure.
+    """
     out_fd, out_path = tempfile.mkstemp(suffix=".wav")
     os.close(out_fd)
     try:
+        ffmpeg_bin = os.environ.get("FFMPEG_BIN") or "ffmpeg"
         cmd = [
-            "ffmpeg",
+            ffmpeg_bin,
             "-y",
             "-i",
             src_path,
@@ -255,9 +382,8 @@ def _collapse_repeats(seq: List[str]) -> List[str]:
     return out
 
 
-def _infer_form_from_chords(beat_chords: List[str]) -> List[str]:
-    """Naive form labeling: hash phrases of length 4 and assign A/B/C by first occurrence."""
-    phrase_len = 4
+def _infer_form_from_chords(beat_chords: List[str], phrase_len: int = 4) -> List[str]:
+    """Form labeling: hash phrases of length phrase_len and assign A/B/C by first occurrence."""
     labels: List[str] = []
     seen = {}
     next_label_ord = ord("A")
@@ -268,5 +394,32 @@ def _infer_form_from_chords(beat_chords: List[str]) -> List[str]:
             next_label_ord += 1
         labels.append(seen[phrase])
     return labels
+
+
+def _select_phrase_len(beat_chords: List[str], candidates: Tuple[int, ...] = (2, 3, 4, 5, 6)) -> int:
+    """Auto-select beats-per-bar by choosing phrase length with most repetition and lowest remainder.
+
+    Scoring: score = unique_phrases_ratio + remainder_penalty, lower is better.
+    """
+    if not beat_chords:
+        return 4
+    best_len = 4
+    best_score = float("inf")
+    total = len(beat_chords)
+    for n in candidates:
+        if n <= 0:
+            continue
+        segments = [tuple(beat_chords[i : i + n]) for i in range(0, total, n)]
+        if not segments:
+            continue
+        unique = len(set(segments))
+        unique_ratio = unique / max(1, len(segments))
+        remainder = total % n
+        remainder_penalty = remainder / n
+        score = unique_ratio + remainder_penalty
+        if score < best_score:
+            best_score = score
+            best_len = n
+    return best_len
 
 

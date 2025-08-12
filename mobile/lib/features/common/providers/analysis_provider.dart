@@ -21,7 +21,9 @@ class AnalysisResult {
   final List<String> form;
   final List<ScaleSuggestionModel> scales;
   final String? localFilePath;
-  AnalysisResult({required this.chords, required this.form, required this.scales, this.localFilePath});
+  final int? beatsPerBar;
+  final String? meter;
+  AnalysisResult({required this.chords, required this.form, required this.scales, this.localFilePath, this.beatsPerBar, this.meter});
 }
 
 class AnalysisNotifier extends StateNotifier<AsyncValue<AnalysisResult?>> {
@@ -55,7 +57,58 @@ class AnalysisNotifier extends StateNotifier<AsyncValue<AnalysisResult?>> {
                   recommendedScales: ((m['recommended_scales'] as List?) ?? []).map((x) => x.toString()).toList(),
                 ))
             .toList();
-        state = AsyncData(AnalysisResult(chords: chords, form: form, scales: scales, localFilePath: filePath));
+        state = AsyncData(AnalysisResult(
+          chords: chords,
+          form: form,
+          scales: scales,
+          localFilePath: filePath,
+          beatsPerBar: (body['beats_per_bar'] as int?),
+          meter: body['meter'] as String?,
+        ));
+      } else {
+        state = AsyncError('Server error: ${res.statusCode}: ${res.body}', StackTrace.current);
+      }
+    } catch (e, st) {
+      state = AsyncError(e, st);
+    }
+  }
+
+  Future<void> analyzeYoutubeUrl(String url, {int? beatsPerBar, String? meter}) async {
+    state = const AsyncLoading();
+    try {
+      final uri = Uri.parse('${AppConfig.apiBaseUrl}/analyze_url').replace(queryParameters: {
+        if (beatsPerBar != null) 'beats_per_bar': beatsPerBar.toString(),
+        if (meter != null) 'meter': meter,
+      });
+      final req = http.MultipartRequest('POST', uri)
+        ..fields['url'] = url;
+      final res = await http.Response.fromStream(await req.send());
+      // ignore: avoid_print
+      print('POST ${uri.toString()} -> ${res.statusCode}');
+      // ignore: avoid_print
+      print(res.body);
+      if (res.statusCode == 200) {
+        final body = json.decode(res.body) as Map<String, dynamic>;
+        final chords = (body['chords'] as List).cast<String>();
+        final form = (body['form'] as List).cast<String>();
+        final scalesJson = (body['scale_suggestions'] as List? ?? []) as List;
+        final scales = scalesJson
+            .map((e) => e as Map<String, dynamic>)
+            .map((m) => ScaleSuggestionModel(
+                  sectionId: (m['section_id'] ?? '').toString(),
+                  chord: (m['chord'] ?? '').toString(),
+                  keyCenter: (m['key_center'] ?? '').toString(),
+                  recommendedScales: ((m['recommended_scales'] as List?) ?? []).map((x) => x.toString()).toList(),
+                ))
+            .toList();
+        state = AsyncData(AnalysisResult(
+          chords: chords,
+          form: form,
+          scales: scales,
+          localFilePath: null,
+          beatsPerBar: (body['beats_per_bar'] as int?),
+          meter: body['meter'] as String?,
+        ));
       } else {
         state = AsyncError('Server error: ${res.statusCode}: ${res.body}', StackTrace.current);
       }
