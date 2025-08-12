@@ -40,6 +40,7 @@ dependencies:
   video_player: ^2.10.0
   purchases_flutter: ^9.2.0
   http: ^1.5.0
+  file_picker: ^10.3.1
 
 dev_dependencies:
   flutter_test:
