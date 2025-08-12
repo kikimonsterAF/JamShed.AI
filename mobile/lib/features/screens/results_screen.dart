@@ -40,9 +40,18 @@ class ResultsScreen extends ConsumerWidget {
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          Text('Form: ${data?.form.join(' | ') ?? '-'}'),
-                          const SizedBox(height: 8),
-                          Text('Chords: ${data?.chords.join('  ') ?? '-'}'),
+                          if (data != null)
+                            Wrap(
+                              spacing: 8,
+                              children: [
+                                for (final s in data.form) Chip(label: Text(s)),
+                              ],
+                            ),
+                          const SizedBox(height: 12),
+                          Text(
+                            data == null ? '—' : data.chords.join('  '),
+                            style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w600),
+                          ),
                         ],
                       ),
                     ),
@@ -52,10 +61,17 @@ class ResultsScreen extends ConsumerWidget {
                       child: ListView(
                         children: [
                           if (data != null)
-                            ...data.scales.map((s) => ListTile(
-                                  title: Text('${s.sectionId} • ${s.chord}'),
-                                  subtitle: Text('Key ${s.keyCenter} — ${s.recommendedScales.join(', ')}'),
-                                )),
+                            ...data.scales.map(
+                              (s) => ListTile(
+                                title: Text('${s.sectionId} • ${s.chord}'),
+                                subtitle: Wrap(
+                                  spacing: 6,
+                                  children: s.recommendedScales
+                                      .map((rs) => Chip(label: Text(rs)))
+                                      .toList(),
+                                ),
+                              ),
+                            ),
                           if (data == null) const Text('No scale suggestions'),
                         ],
                       ),

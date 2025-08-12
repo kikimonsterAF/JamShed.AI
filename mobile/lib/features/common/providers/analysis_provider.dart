@@ -20,7 +20,8 @@ class AnalysisResult {
   final List<String> chords;
   final List<String> form;
   final List<ScaleSuggestionModel> scales;
-  AnalysisResult({required this.chords, required this.form, required this.scales});
+  final String? localFilePath;
+  AnalysisResult({required this.chords, required this.form, required this.scales, this.localFilePath});
 }
 
 class AnalysisNotifier extends StateNotifier<AsyncValue<AnalysisResult?>> {
@@ -49,7 +50,7 @@ class AnalysisNotifier extends StateNotifier<AsyncValue<AnalysisResult?>> {
                   recommendedScales: ((m['recommended_scales'] as List?) ?? []).map((x) => x.toString()).toList(),
                 ))
             .toList();
-        state = AsyncData(AnalysisResult(chords: chords, form: form, scales: scales));
+        state = AsyncData(AnalysisResult(chords: chords, form: form, scales: scales, localFilePath: filePath));
       } else {
         state = AsyncError('Server error: ${res.statusCode}', StackTrace.current);
       }
