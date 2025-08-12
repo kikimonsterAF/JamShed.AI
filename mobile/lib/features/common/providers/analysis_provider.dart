@@ -29,7 +29,7 @@ class AnalysisResult {
 class AnalysisNotifier extends StateNotifier<AsyncValue<AnalysisResult?>> {
   AnalysisNotifier() : super(const AsyncData(null));
 
-  Future<void> uploadAndAnalyze(String filePath, {String? instrument, String? difficulty}) async {
+  Future<void> uploadAndAnalyze(String filePath, {String? instrument, String? difficulty, int? beatsPerBar, String? meter}) async {
     state = const AsyncLoading();
     try {
       final uri = Uri.parse('${AppConfig.apiBaseUrl}/analyze');
@@ -37,6 +37,8 @@ class AnalysisNotifier extends StateNotifier<AsyncValue<AnalysisResult?>> {
         ..files.add(await http.MultipartFile.fromPath('file', filePath));
       if (instrument != null) req.fields['instrument'] = instrument;
       if (difficulty != null) req.fields['difficulty'] = difficulty;
+      if (beatsPerBar != null) req.fields['beats_per_bar'] = beatsPerBar.toString();
+      if (meter != null) req.fields['meter'] = meter;
       final res = await http.Response.fromStream(await req.send());
       // Debug: log the request/response for troubleshooting 404s
       // ignore: avoid_print

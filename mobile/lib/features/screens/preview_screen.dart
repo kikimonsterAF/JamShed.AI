@@ -15,12 +15,14 @@ class PreviewScreen extends ConsumerWidget {
         padding: const EdgeInsets.all(16),
         child: Column(
           children: [
+            const _MeterSelector(),
             FilledButton(
               onPressed: () async {
                 final result = await FilePicker.platform.pickFiles(type: FileType.media);
                 final path = result?.files.single.path;
                 if (path == null) return;
-                await ref.read(analysisProvider.notifier).uploadAndAnalyze(path);
+                final bpb = _MeterSelector.of(context)?.selectedBpb;
+                await ref.read(analysisProvider.notifier).uploadAndAnalyze(path, beatsPerBar: bpb, meter: bpb != null ? '${bpb}/4' : null);
                 if (context.mounted) context.push('/instrument');
               },
               child: const Text('Choose file and Analyze'),
@@ -37,6 +39,39 @@ class PreviewScreen extends ConsumerWidget {
           ],
         ),
       ),
+    );
+  }
+}
+
+
+class _MeterSelector extends StatefulWidget {
+  const _MeterSelector();
+  static _MeterSelectorState? of(BuildContext context) => context.findAncestorStateOfType<_MeterSelectorState>();
+  @override
+  State<_MeterSelector> createState() => _MeterSelectorState();
+}
+
+class _MeterSelectorState extends State<_MeterSelector> {
+  int? selectedBpb; // null = Auto
+  final options = const [null, 2, 3, 4];
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      children: [
+        const Text('Meter:'),
+        const SizedBox(width: 8),
+        Wrap(
+          spacing: 8,
+          children: options
+              .map((o) => ChoiceChip(
+                    label: Text(o == null ? 'Auto' : '${o}/4'),
+                    selected: selectedBpb == o,
+                    onSelected: (_) => setState(() => selectedBpb = o),
+                  ))
+              .toList(),
+        ),
+      ],
     );
   }
 }

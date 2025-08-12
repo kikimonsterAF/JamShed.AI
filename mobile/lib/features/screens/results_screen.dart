@@ -26,9 +26,20 @@ class ResultsScreen extends ConsumerWidget {
         ),
         body: Column(
           children: [
-            const Padding(
-              padding: EdgeInsets.all(12),
-              child: UsageMeter(),
+            Padding(
+              padding: const EdgeInsets.all(12),
+              child: Row(
+                children: [
+                  const Expanded(child: UsageMeter()),
+                  const SizedBox(width: 12),
+                  Consumer(builder: (context, ref, _) {
+                    final d = ref.watch(analysisProvider).valueOrNull;
+                    if (d == null) return const SizedBox.shrink();
+                    final meter = d.meter ?? (d.beatsPerBar != null ? '${d.beatsPerBar}/4' : '');
+                    return Text(meter, style: const TextStyle(fontWeight: FontWeight.w600));
+                  }),
+                ],
+              ),
             ),
             Expanded(
               child: analysis.when(
@@ -48,8 +59,8 @@ class ResultsScreen extends ConsumerWidget {
                               ],
                             ),
                           const SizedBox(height: 12),
-                          Text(
-                            data == null ? '—' : data.chords.join('  '),
+                           Text(
+                             data == null ? '—' : data.chords.join('  '),
                             style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w600),
                           ),
                         ],

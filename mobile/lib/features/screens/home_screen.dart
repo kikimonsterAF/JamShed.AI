@@ -52,6 +52,8 @@ class _YoutubeInputRow extends ConsumerStatefulWidget {
 class _YoutubeInputRowState extends ConsumerState<_YoutubeInputRow> {
   final _controller = TextEditingController();
   bool _loading = false;
+  int? _beatsPerBar; // null = Auto
+  final _meterOptions = const [null, 2, 3, 4];
 
   @override
   void dispose() {
@@ -66,12 +68,28 @@ class _YoutubeInputRowState extends ConsumerState<_YoutubeInputRow> {
     return Row(
       children: [
         Expanded(
-          child: TextField(
-            controller: _controller,
-            decoration: const InputDecoration(
-              labelText: 'YouTube URL',
-              hintText: 'https://www.youtube.com/watch?v=...'
-            ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              TextField(
+                controller: _controller,
+                decoration: const InputDecoration(
+                  labelText: 'YouTube URL',
+                  hintText: 'https://www.youtube.com/watch?v=...'
+                ),
+              ),
+              const SizedBox(height: 8),
+              Wrap(
+                spacing: 8,
+                children: _meterOptions
+                    .map((o) => ChoiceChip(
+                          label: Text(o == null ? 'Auto' : '${o}/4'),
+                          selected: _beatsPerBar == o,
+                          onSelected: (_) => setState(() => _beatsPerBar = o),
+                        ))
+                    .toList(),
+              ),
+            ],
           ),
         ),
         const SizedBox(width: 8),
@@ -81,10 +99,16 @@ class _YoutubeInputRowState extends ConsumerState<_YoutubeInputRow> {
               : () async {
                   final url = _controller.text.trim();
                   if (url.isEmpty) return;
-                  await ref.read(analysisProvider.notifier).analyzeYoutubeUrl(url);
+                  await ref.read(analysisProvider.notifier).analyzeYoutubeUrl(
+                        url,
+                        beatsPerBar: _beatsPerBar,
+                        meter: _beatsPerBar != null ? '${_beatsPerBar}/4' : null,
+                      );
                   if (context.mounted) context.push('/instrument');
                 },
-          child: _loading ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2)) : const Text('Analyze'),
+          child: _loading
+              ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))
+              : const Text('Analyze'),
         )
       ],
     );
