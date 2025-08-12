@@ -36,6 +36,11 @@ class AnalysisNotifier extends StateNotifier<AsyncValue<AnalysisResult?>> {
       if (instrument != null) req.fields['instrument'] = instrument;
       if (difficulty != null) req.fields['difficulty'] = difficulty;
       final res = await http.Response.fromStream(await req.send());
+      // Debug: log the request/response for troubleshooting 404s
+      // ignore: avoid_print
+      print('POST ${uri.toString()} -> ${res.statusCode}');
+      // ignore: avoid_print
+      print(res.body);
       if (res.statusCode == 200) {
         final body = json.decode(res.body) as Map<String, dynamic>;
         final chords = (body['chords'] as List).cast<String>();
@@ -52,7 +57,7 @@ class AnalysisNotifier extends StateNotifier<AsyncValue<AnalysisResult?>> {
             .toList();
         state = AsyncData(AnalysisResult(chords: chords, form: form, scales: scales, localFilePath: filePath));
       } else {
-        state = AsyncError('Server error: ${res.statusCode}', StackTrace.current);
+        state = AsyncError('Server error: ${res.statusCode}: ${res.body}', StackTrace.current);
       }
     } catch (e, st) {
       state = AsyncError(e, st);
