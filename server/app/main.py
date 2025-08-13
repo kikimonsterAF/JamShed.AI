@@ -226,19 +226,7 @@ def _analyze_path(
             size = -1
         raise HTTPException(status_code=400, detail=f"Failed to decode audio (path={src_path}, size={size}). Ensure FFmpeg/ffprobe are available and the media is valid.")
 
-    # Chroma features and beat-synchronous pooling
-    chroma, beat_frames = _compute_beatsynced_chroma(y, sr)
-
-    # Key estimation (allow override)
-    if force_key and isinstance(force_key, str):
-        key_center = force_key.strip().upper()
-        key_mode = (force_key_mode or 'major').strip().lower()
-        if key_center not in _NOTE_NAMES_SHARP:
-            key_center, key_mode = _estimate_key_from_chroma(chroma)
-    else:
-        key_center, key_mode = _estimate_key_from_chroma(chroma)
-
-    # Select phrase length (user override or auto) - do this first
+    # Select phrase length (user override or auto) - do this FIRST
     user_bpb: Optional[int] = None
     if beats_per_bar and beats_per_bar > 0:
         user_bpb = int(beats_per_bar)
@@ -252,6 +240,18 @@ def _analyze_path(
     
     # For chord inference, we need a preliminary beats_per_bar estimate
     preliminary_bpb = user_bpb or 4  # Default to 4 if not specified
+
+    # Chroma features and beat-synchronous pooling
+    chroma, beat_frames = _compute_beatsynced_chroma(y, sr, preliminary_bpb)
+
+    # Key estimation (allow override)
+    if force_key and isinstance(force_key, str):
+        key_center = force_key.strip().upper()
+        key_mode = (force_key_mode or 'major').strip().lower()
+        if key_center not in _NOTE_NAMES_SHARP:
+            key_center, key_mode = _estimate_key_from_chroma(chroma)
+    else:
+        key_center, key_mode = _estimate_key_from_chroma(chroma)
     
     # Chords and collapsed progression (beat-level), with optional ML smoothing
     use_ml_enabled = bool(use_ml) and int(use_ml) == 1
@@ -281,6 +281,11 @@ def _analyze_path(
     
     # Apply temporal smoothing to reduce jitter
     beat_chords = _apply_temporal_smoothing(beat_chords, preliminary_bpb)
+    
+    # Apply downbeat-aligned phrase segmentation for better verse/chorus detection (skip if chords are too repetitive)
+    unique_chords = set(beat_chords)
+    if len(unique_chords) > 1:  # Only apply if we have chord variety
+        beat_chords = _align_chords_to_phrases(beat_chords, beat_frames, preliminary_bpb)
     chords_progression = _collapse_repeats(beat_chords)
     
     # Final beats per bar selection (may use auto-detection on cleaned chords)
@@ -290,10 +295,10 @@ def _analyze_path(
     bpb = max(1, selected_bpb or 4)
     bar_roots = _aggregate_to_bars(beat_chords, bpb)
     roman_tokens = _map_chords_to_roman(bar_roots, key_center, key_mode)
-    # Auto select bars-per-phrase (2,4,8) on bar tokens
-    bars_per_phrase = _select_bars_per_phrase(roman_tokens, bpb, candidates=(2, 4, 8))
+    # Auto select bars-per-phrase (4,8) on bar tokens - prefer longer phrases for cleaner structure
+    bars_per_phrase = _select_bars_per_phrase(roman_tokens, bpb, candidates=(4, 8))
     off_tokens = _select_best_offset_tokens(roman_tokens, bars_per_phrase)
-    form_labels = _infer_form_from_tokens(roman_tokens[off_tokens:], phrase_len=bars_per_phrase, similarity_threshold=0.75)
+    form_labels = _infer_form_from_tokens(roman_tokens[off_tokens:], phrase_len=bars_per_phrase, similarity_threshold=0.6)
 
     # Build section summaries (first occurrence exemplar per label)
     section_map = {}
@@ -402,13 +407,13 @@ def _decode_audio_with_ffmpeg(src_path: str, target_sr: int = 22050) -> Tuple[np
             pass
 
 
-def _compute_beatsynced_chroma(y: np.ndarray, sr: int) -> Tuple[np.ndarray, np.ndarray]:
+def _compute_beatsynced_chroma(y: np.ndarray, sr: int, beats_per_bar: int = 4) -> Tuple[np.ndarray, np.ndarray]:
     """Enhanced chroma computation with robust beat tracking for chord inference."""
     # Enhanced chroma processing
     chroma = _compute_enhanced_chroma(y, sr)
     
-    # Robust beat tracking
-    beats = _robust_beat_tracking(y, sr)
+    # Robust beat tracking with downbeat detection
+    beats, downbeats = _robust_beat_tracking(y, sr, beats_per_bar)
     
     if beats.size == 0:
         # Fallback: frame-wise pooling into fixed windows
@@ -499,7 +504,7 @@ def _robust_beat_tracking(y: np.ndarray, sr: int) -> np.ndarray:
     except Exception:
         # Fallback: regular grid based on estimated tempo
         try:
-            tempo_est = librosa.beat.tempo(y=y, sr=sr)[0]
+            tempo_est = librosa.feature.rhythm.tempo(y=y, sr=sr)[0]
             beat_interval = 60.0 / max(60, min(200, tempo_est))  # Clamp to reasonable range
         except Exception:
             beat_interval = 0.5  # 120 BPM default
@@ -509,6 +514,119 @@ def _robust_beat_tracking(y: np.ndarray, sr: int) -> np.ndarray:
         beats = librosa.time_to_frames(beat_times, sr=sr, hop_length=512)
         
     return beats.astype(int)
+
+
+def _robust_beat_tracking(y: np.ndarray, sr: int, beats_per_bar: int = 4) -> Tuple[np.ndarray, np.ndarray]:
+    """Enhanced beat tracking with downbeat detection for phrase alignment."""
+    # Get basic beats first
+    beats = _get_basic_beats(y, sr)
+    
+    # Detect downbeats for phrase alignment
+    if len(beats) >= beats_per_bar:
+        downbeats = _detect_downbeats(y, sr, beats, beats_per_bar)
+    else:
+        downbeats = beats[:1] if len(beats) > 0 else np.array([0])
+        
+    return beats, downbeats
+
+
+def _get_basic_beats(y: np.ndarray, sr: int) -> np.ndarray:
+    """Get basic beat positions using librosa."""
+    try:
+        # Primary approach: standard librosa with tuned parameters
+        tempo1, beats1 = librosa.beat.beat_track(
+            y=y, sr=sr, hop_length=512, start_bpm=60, std_bpm=120, 
+            tightness=100, trim=False
+        )
+        
+        # Secondary approach: different hop length and tightness
+        tempo2, beats2 = librosa.beat.beat_track(
+            y=y, sr=sr, hop_length=256, start_bpm=80, std_bpm=80,
+            tightness=200, trim=False
+        )
+        
+        # Evaluate regularity of beat intervals
+        if len(beats1) > 1 and len(beats2) > 1:
+            intervals1 = np.diff(librosa.frames_to_time(beats1, sr=sr, hop_length=512))
+            intervals2 = np.diff(librosa.frames_to_time(beats2, sr=sr, hop_length=256))
+            
+            # Coefficient of variation (lower = more regular)
+            cv1 = np.std(intervals1) / (np.mean(intervals1) + 1e-8)
+            cv2 = np.std(intervals2) / (np.mean(intervals2) + 1e-8)
+            
+            # Choose more regular pattern
+            beats = beats1 if cv1 < cv2 else beats2
+            hop_used = 512 if cv1 < cv2 else 256
+        else:
+            beats = beats1 if len(beats1) >= len(beats2) else beats2
+            hop_used = 512 if len(beats1) >= len(beats2) else 256
+            
+        # Convert to consistent hop_length=512 frame indices
+        if hop_used == 256:
+            beats = beats * 2  # Scale up to 512 hop_length
+            
+    except Exception:
+        # Fallback: regular grid based on estimated tempo
+        try:
+            tempo_est = librosa.feature.rhythm.tempo(y=y, sr=sr)[0]
+            beat_interval = 60.0 / max(60, min(200, tempo_est))  # Clamp to reasonable range
+        except Exception:
+            beat_interval = 0.5  # 120 BPM default
+            
+        duration = len(y) / sr
+        beat_times = np.arange(0, duration, beat_interval)
+        beats = librosa.time_to_frames(beat_times, sr=sr, hop_length=512)
+        
+    return beats.astype(int)
+
+
+def _detect_downbeats(y: np.ndarray, sr: int, beats: np.ndarray, beats_per_bar: int) -> np.ndarray:
+    """Detect downbeats using spectral flux and harmonic change detection."""
+    if len(beats) < beats_per_bar:
+        return beats[:1] if len(beats) > 0 else np.array([0])
+    
+    # Compute spectral flux for onset strength
+    S = np.abs(librosa.stft(y, hop_length=512))
+    flux = np.sum(np.diff(S, axis=1), axis=0)
+    flux = np.concatenate([[0], flux])  # Pad to match frame count
+    
+    # Sync flux to beat positions
+    beat_flux = []
+    for i, beat_frame in enumerate(beats):
+        if beat_frame < len(flux):
+            beat_flux.append(flux[beat_frame])
+        else:
+            beat_flux.append(0.0)
+    beat_flux = np.array(beat_flux)
+    
+    # Find periodic peaks in flux that align with potential downbeats
+    candidate_downbeats = []
+    
+    # Method 1: Peak-based detection with beat regularity
+    for start_offset in range(min(beats_per_bar, len(beats))):
+        downbeat_candidates = beats[start_offset::beats_per_bar]
+        if len(downbeat_candidates) < 2:
+            continue
+            
+        # Score this offset by flux strength at candidate positions
+        flux_scores = []
+        for db_frame in downbeat_candidates:
+            idx = np.where(beats == db_frame)[0]
+            if len(idx) > 0 and idx[0] < len(beat_flux):
+                flux_scores.append(beat_flux[idx[0]])
+            else:
+                flux_scores.append(0.0)
+        
+        avg_flux = np.mean(flux_scores)
+        candidate_downbeats.append((avg_flux, start_offset, downbeat_candidates))
+    
+    # Choose offset with highest average flux (strongest downbeats)
+    if candidate_downbeats:
+        best_offset = max(candidate_downbeats, key=lambda x: x[0])
+        return best_offset[2]
+    
+    # Fallback: regular spacing
+    return beats[::beats_per_bar]
 
 
 def _estimate_key_from_chroma(chroma: np.ndarray) -> Tuple[str, str]:
@@ -618,6 +736,105 @@ def _apply_temporal_smoothing(chords: List[str], beats_per_bar: int) -> List[str
             smoothed.extend(bar_chords)
     
     return smoothed
+
+
+def _align_chords_to_phrases(chords: List[str], beat_frames: np.ndarray, beats_per_bar: int) -> List[str]:
+    """Align chords to musical phrases using 4-bar and 8-bar phrase boundaries."""
+    if len(chords) < beats_per_bar * 2:  # Need at least 2 bars
+        return chords
+    
+    # Define phrase lengths to try (in bars)
+    phrase_lengths = [4, 8]  # 4-bar and 8-bar phrases common in popular music
+    
+    best_aligned = chords
+    best_score = float('inf')
+    
+    for phrase_bars in phrase_lengths:
+        phrase_len_beats = beats_per_bar * phrase_bars
+        if phrase_len_beats > len(chords):
+            continue
+            
+        # Try different starting offsets within the first phrase
+        for offset in range(min(phrase_len_beats, len(chords))):
+            aligned = _align_to_phrase_boundaries(chords, offset, phrase_len_beats)
+            
+            # Score this alignment by chord transition consistency
+            score = _score_phrase_alignment(aligned, phrase_len_beats)
+            
+            if score < best_score:
+                best_score = score
+                best_aligned = aligned
+    
+    return best_aligned
+
+
+def _align_to_phrase_boundaries(chords: List[str], offset: int, phrase_len: int) -> List[str]:
+    """Align chord sequence to phrase boundaries with given offset."""
+    if phrase_len <= 0 or len(chords) == 0:
+        return chords
+        
+    aligned = chords.copy()
+    
+    # Process each phrase
+    for phrase_start in range(offset, len(chords), phrase_len):
+        phrase_end = min(phrase_start + phrase_len, len(chords))
+        phrase = chords[phrase_start:phrase_end]
+        
+        if len(phrase) < phrase_len // 2:  # Skip incomplete phrases
+            continue
+            
+        # Find the most common chord in this phrase (dominant harmony)
+        chord_counts = {}
+        for chord in phrase:
+            chord_counts[chord] = chord_counts.get(chord, 0) + 1
+        
+        if chord_counts:
+            dominant_chord = max(chord_counts.items(), key=lambda x: x[1])[0]
+            
+            # If the dominant chord appears in >40% of the phrase, extend it more
+            dominant_ratio = chord_counts[dominant_chord] / len(phrase)
+            if dominant_ratio > 0.4:
+                # Smooth out brief chord changes within this phrase
+                for i in range(phrase_start, phrase_end):
+                    if i < len(aligned):
+                        # Replace isolated single-beat chords with dominant chord
+                        if (i == phrase_start or aligned[i-1] == dominant_chord) and \
+                           (i == phrase_end-1 or (i+1 < len(aligned) and aligned[i+1] == dominant_chord)):
+                            aligned[i] = dominant_chord
+    
+    return aligned
+
+
+def _score_phrase_alignment(chords: List[str], phrase_len: int) -> float:
+    """Score chord alignment quality - lower is better."""
+    if phrase_len <= 0 or len(chords) < phrase_len:
+        return float('inf')
+    
+    # Count chord transitions within vs across phrase boundaries
+    within_phrase_changes = 0
+    cross_phrase_changes = 0
+    total_within = 0
+    total_cross = 0
+    
+    for i in range(1, len(chords)):
+        is_phrase_boundary = (i % phrase_len) == 0
+        is_chord_change = chords[i] != chords[i-1]
+        
+        if is_phrase_boundary:
+            total_cross += 1
+            if is_chord_change:
+                cross_phrase_changes += 1
+        else:
+            total_within += 1
+            if is_chord_change:
+                within_phrase_changes += 1
+    
+    # Good alignment has fewer changes within phrases, more at boundaries
+    within_rate = within_phrase_changes / max(1, total_within)
+    cross_rate = cross_phrase_changes / max(1, total_cross)
+    
+    # Score: lower is better (prefer boundaries with changes, stable within phrases)
+    return within_rate - 0.5 * cross_rate
 
 
 def _create_weighted_templates() -> Tuple[List[np.ndarray], List[str]]:
@@ -794,13 +1011,35 @@ def _select_best_offset_tokens(tokens: List[str], phrase_len: int) -> int:
 
 def _infer_form_from_tokens(tokens: List[str], phrase_len: int, similarity_threshold: float = 0.7) -> List[str]:
     def sim(a: List[str], b: List[str]) -> float:
-        L = min(len(a), len(b))
-        if L == 0:
+        """Enhanced similarity using dominant chord patterns instead of exact matches."""
+        from collections import Counter
+        if not a or not b:
             return 0.0
-        return sum(1 for x, y in zip(a[:L], b[:L]) if x == y) / float(L)
+        
+        # Get the most common chord in each phrase (dominant harmony)
+        counts_a = Counter(a)
+        counts_b = Counter(b)
+        
+        top_a = counts_a.most_common(2)  # Top 2 chords
+        top_b = counts_b.most_common(2)  # Top 2 chords
+        
+        # Extract just the chord names
+        chords_a = set(chord for chord, _ in top_a)
+        chords_b = set(chord for chord, _ in top_b)
+        
+        # Jaccard similarity on dominant chords
+        intersection = len(chords_a & chords_b)
+        union = len(chords_a | chords_b)
+        
+        if union == 0:
+            return 1.0 if len(a) == len(b) == 0 else 0.0
+        
+        return intersection / union
+    
     labels: List[str] = []
     exemplars: List[List[str]] = []
     next_label_ord = ord('A')
+    
     for i in range(0, len(tokens), phrase_len):
         phrase = tokens[i:i+phrase_len]
         if not phrase:
@@ -812,12 +1051,25 @@ def _infer_form_from_tokens(tokens: List[str], phrase_len: int, similarity_thres
             if s > best_sim:
                 best_sim = s
                 best_idx = idx
-        if best_idx >= 0 and best_sim >= similarity_threshold:
+        
+        # Use a more relaxed threshold and limit to 4 sections max
+        relaxed_threshold = 0.4  # More permissive for better A-B-A-B detection
+        if best_idx >= 0 and best_sim >= relaxed_threshold:
             labels.append(chr(ord('A') + best_idx))
         else:
-            exemplars.append(phrase)
-            labels.append(chr(next_label_ord))
-            next_label_ord += 1
+            # Limit to 4 sections (A, B, C, D) for typical song structure
+            if len(exemplars) < 4:
+                exemplars.append(phrase)
+                labels.append(chr(next_label_ord))
+                next_label_ord += 1
+            else:
+                # Force assignment to existing section if we already have 4
+                if exemplars:
+                    best_existing = max(range(len(exemplars)), 
+                                       key=lambda idx: sim(phrase, exemplars[idx]))
+                    labels.append(chr(ord('A') + best_existing))
+                else:
+                    labels.append('A')
     return labels
 
 
