@@ -64,6 +64,9 @@ async def analyze(
     difficulty: Optional[str] = None,
     beats_per_bar: Optional[int] = None,
     meter: Optional[str] = None,
+    use_ml: Optional[int] = None,
+    force_key: Optional[str] = None,
+    force_key_mode: Optional[str] = None,
 ) -> AnalysisResponse:
     allowed_types = {
         "audio/mpeg",  # .mp3
@@ -106,6 +109,9 @@ async def analyze(
             difficulty=difficulty,
             beats_per_bar=beats_per_bar,
             meter=meter,
+            use_ml=use_ml,
+            force_key=force_key,
+            force_key_mode=force_key_mode,
         )
         return result
     finally:
@@ -126,6 +132,9 @@ async def analyze_url(
     difficulty: Optional[str] = None,
     beats_per_bar: Optional[int] = None,
     meter: Optional[str] = None,
+    use_ml: Optional[int] = None,
+    force_key: Optional[str] = None,
+    force_key_mode: Optional[str] = None,
 ) -> AnalysisResponse:
     """Download audio from YouTube (or other supported sites) and analyze it.
     Requires yt-dlp and ffmpeg to be present.
@@ -192,6 +201,9 @@ async def analyze_url(
             difficulty=difficulty,
             beats_per_bar=beats_per_bar,
             meter=meter,
+            use_ml=use_ml,
+            force_key=force_key,
+            force_key_mode=force_key_mode,
         )
 
 
@@ -201,6 +213,9 @@ def _analyze_path(
     difficulty: Optional[str],
     beats_per_bar: Optional[int],
     meter: Optional[str],
+    use_ml: Optional[int],
+    force_key: Optional[str],
+    force_key_mode: Optional[str],
 ) -> AnalysisResponse:
     # Decode to mono PCM WAV (22.05 kHz) via ffmpeg
     y, sr = _decode_audio_with_ffmpeg(src_path, target_sr=22050)
@@ -214,14 +229,16 @@ def _analyze_path(
     # Chroma features and beat-synchronous pooling
     chroma, beat_frames = _compute_beatsynced_chroma(y, sr)
 
-    # Key estimation
-    key_center, key_mode = _estimate_key_from_chroma(chroma)
+    # Key estimation (allow override)
+    if force_key and isinstance(force_key, str):
+        key_center = force_key.strip().upper()
+        key_mode = (force_key_mode or 'major').strip().lower()
+        if key_center not in _NOTE_NAMES_SHARP:
+            key_center, key_mode = _estimate_key_from_chroma(chroma)
+    else:
+        key_center, key_mode = _estimate_key_from_chroma(chroma)
 
-    # Chords and collapsed progression
-    beat_chords = _infer_chords_from_chroma(chroma)
-    chords_progression = _collapse_repeats(beat_chords)
-
-    # Select phrase length (user override or auto)
+    # Select phrase length (user override or auto) - do this first
     user_bpb: Optional[int] = None
     if beats_per_bar and beats_per_bar > 0:
         user_bpb = int(beats_per_bar)
@@ -232,23 +249,60 @@ def _analyze_path(
                 user_bpb = num
         except Exception:
             user_bpb = None
+    
+    # For chord inference, we need a preliminary beats_per_bar estimate
+    preliminary_bpb = user_bpb or 4  # Default to 4 if not specified
+    
+    # Chords and collapsed progression (beat-level), with optional ML smoothing
+    use_ml_enabled = bool(use_ml) and int(use_ml) == 1
+    if use_ml_enabled:
+        # Constrain to diatonic triads in forced or estimated key
+        key_center_eff, key_mode_eff = key_center, key_mode
+        # Diatonic pitch classes for major/minor
+        scale = [0, 2, 4, 5, 7, 9, 11]
+        if key_mode_eff == 'minor':
+            # Natural minor degrees triad qualities: i, ii°, III, iv, v, VI, VII (approximate without diminished)
+            qualities = ['min','min','maj','min','min','maj','maj']
+        else:
+            # Major: I, ii, iii, IV, V, vi, vii° (approximate without diminished)
+            qualities = ['maj','min','min','maj','maj','min','min']
+        allowed = []
+        try:
+            tonic_idx = _NOTE_NAMES_SHARP.index(key_center_eff)
+            for deg, q in zip(scale, qualities):
+                pc = (tonic_idx + deg) % 12
+                name = _NOTE_NAMES_SHARP[pc]
+                allowed.append(name if q == 'maj' else name + 'm')
+        except Exception:
+            allowed = None
+        beat_chords = _infer_chords_from_chroma_viterbi(chroma, allowed_labels=allowed)
+    else:
+        beat_chords = _infer_chords_from_chroma(chroma, key_center, key_mode)
+    
+    # Apply temporal smoothing to reduce jitter
+    beat_chords = _apply_temporal_smoothing(beat_chords, preliminary_bpb)
+    chords_progression = _collapse_repeats(beat_chords)
+    
+    # Final beats per bar selection (may use auto-detection on cleaned chords)
     selected_bpb = user_bpb or _select_phrase_len(beat_chords)
 
-    # Form labels: derive roman-degree tokens and group by larger multi-bar phrases (auto select 2/4/8 bars)
-    roman_tokens = _map_chords_to_roman(beat_chords, key_center, key_mode)
-    bars_per_phrase = _select_bars_per_phrase(roman_tokens, (selected_bpb or 4), candidates=(2, 4, 8))
-    phrase_len_for_form = max(1, (selected_bpb or 4) * bars_per_phrase)
-    off_tokens = _select_best_offset_tokens(roman_tokens, phrase_len_for_form)
-    form_labels = _infer_form_from_tokens(roman_tokens[off_tokens:], phrase_len=phrase_len_for_form, similarity_threshold=0.75)
+    # Aggregate to bar-level roots to reduce jitter, then derive roman tokens on bars
+    bpb = max(1, selected_bpb or 4)
+    bar_roots = _aggregate_to_bars(beat_chords, bpb)
+    roman_tokens = _map_chords_to_roman(bar_roots, key_center, key_mode)
+    # Auto select bars-per-phrase (2,4,8) on bar tokens
+    bars_per_phrase = _select_bars_per_phrase(roman_tokens, bpb, candidates=(2, 4, 8))
+    off_tokens = _select_best_offset_tokens(roman_tokens, bars_per_phrase)
+    form_labels = _infer_form_from_tokens(roman_tokens[off_tokens:], phrase_len=bars_per_phrase, similarity_threshold=0.75)
 
     # Build section summaries (first occurrence exemplar per label)
     section_map = {}
     section_summaries: List[SectionSummary] = []
-    # Slice original chords/romans by the same offset and phrase window
-    chords_offset = beat_chords[off_tokens:]
+    # Slice bar-level roots/romans by the same offset and phrase window (bars)
+    chords_offset = bar_roots[off_tokens:]
     for idx, lbl in enumerate(form_labels):
-        start = idx * phrase_len_for_form
-        end = start + phrase_len_for_form
+        start = idx * bars_per_phrase
+        end = start + bars_per_phrase
         if start >= len(chords_offset):
             break
         ch_slice = chords_offset[start:end]
@@ -256,7 +310,11 @@ def _analyze_path(
         if lbl not in section_map:
             section_map[lbl] = True
             section_summaries.append(
-                SectionSummary(label=lbl, chords=_collapse_repeats(ch_slice), roman_chords=_collapse_repeats(rm_slice))
+                SectionSummary(
+                    label=lbl,
+                    chords=_topk_roots(ch_slice, k=3),
+                    roman_chords=_topk_tokens(rm_slice, k=3),
+                )
             )
 
     # Scale suggestions
@@ -345,18 +403,112 @@ def _decode_audio_with_ffmpeg(src_path: str, target_sr: int = 22050) -> Tuple[np
 
 
 def _compute_beatsynced_chroma(y: np.ndarray, sr: int) -> Tuple[np.ndarray, np.ndarray]:
-    """Compute chroma-cqt and aggregate per beat for chord inference."""
-    y = librosa.effects.harmonic(y)
-    chroma = librosa.feature.chroma_cqt(y=y, sr=sr)
-    tempo, beats = librosa.beat.beat_track(y=y, sr=sr)
+    """Enhanced chroma computation with robust beat tracking for chord inference."""
+    # Enhanced chroma processing
+    chroma = _compute_enhanced_chroma(y, sr)
+    
+    # Robust beat tracking
+    beats = _robust_beat_tracking(y, sr)
+    
     if beats.size == 0:
         # Fallback: frame-wise pooling into fixed windows
         frames = chroma.shape[1]
         window = max(1, frames // 32)
         pools = [chroma[:, i : i + window].mean(axis=1) for i in range(0, frames, window)]
         return np.stack(pools, axis=1), np.arange(len(pools))
-    beat_chroma = librosa.util.sync(chroma, beats, aggregate=np.mean)
+    
+    # Sync chroma to beats with median aggregation (more robust than mean)
+    beat_chroma = librosa.util.sync(chroma, beats, aggregate=np.median)
     return beat_chroma, beats
+
+
+def _compute_enhanced_chroma(y: np.ndarray, sr: int) -> np.ndarray:
+    """Multi-variant chroma processing for improved pitch clarity."""
+    hop_length = 512
+    
+    # Harmonic-percussive separation for cleaner pitch content
+    y_harmonic = librosa.effects.harmonic(y, margin=8.0)
+    
+    # Multiple chroma variants
+    chroma_cqt = librosa.feature.chroma_cqt(
+        y=y_harmonic, sr=sr, hop_length=hop_length, 
+        fmin=librosa.note_to_hz('C2'), norm=2
+    )
+    
+    chroma_stft = librosa.feature.chroma_stft(
+        y=y, sr=sr, hop_length=hop_length, norm=2
+    )
+    
+    # High-resolution CQT for better fundamental tracking
+    chroma_cqt_hr = librosa.feature.chroma_cqt(
+        y=y_harmonic, sr=sr, hop_length=hop_length//2,
+        fmin=librosa.note_to_hz('C2'), bins_per_octave=24, norm=2
+    )
+    # Downsample high-res to match others
+    if chroma_cqt_hr.shape[1] > chroma_cqt.shape[1]:
+        target_frames = chroma_cqt.shape[1]
+        chroma_cqt_hr = librosa.util.fix_length(chroma_cqt_hr, size=target_frames, axis=1)
+    
+    # Weighted combination emphasizing harmonic content
+    chroma = 0.5 * chroma_cqt + 0.3 * chroma_cqt_hr + 0.2 * chroma_stft
+    
+    # Log-compression to reduce dynamic range
+    chroma = np.log1p(chroma * 1000)
+    
+    # Normalize each frame
+    chroma_norm = chroma / (np.linalg.norm(chroma, axis=0, keepdims=True) + 1e-8)
+    
+    return chroma_norm
+
+
+def _robust_beat_tracking(y: np.ndarray, sr: int) -> np.ndarray:
+    """Multiple beat tracking approaches for improved reliability."""
+    try:
+        # Primary approach: standard librosa with tuned parameters
+        tempo1, beats1 = librosa.beat.beat_track(
+            y=y, sr=sr, hop_length=512, start_bpm=60, std_bpm=120, 
+            tightness=100, trim=False
+        )
+        
+        # Secondary approach: different hop length and tightness
+        tempo2, beats2 = librosa.beat.beat_track(
+            y=y, sr=sr, hop_length=256, start_bpm=80, std_bpm=80,
+            tightness=200, trim=False
+        )
+        
+        # Evaluate regularity of beat intervals
+        if len(beats1) > 1 and len(beats2) > 1:
+            intervals1 = np.diff(librosa.frames_to_time(beats1, sr=sr, hop_length=512))
+            intervals2 = np.diff(librosa.frames_to_time(beats2, sr=sr, hop_length=256))
+            
+            # Coefficient of variation (lower = more regular)
+            cv1 = np.std(intervals1) / (np.mean(intervals1) + 1e-8)
+            cv2 = np.std(intervals2) / (np.mean(intervals2) + 1e-8)
+            
+            # Choose more regular pattern
+            beats = beats1 if cv1 < cv2 else beats2
+            hop_used = 512 if cv1 < cv2 else 256
+        else:
+            beats = beats1 if len(beats1) >= len(beats2) else beats2
+            hop_used = 512 if len(beats1) >= len(beats2) else 256
+            
+        # Convert to consistent hop_length=512 frame indices
+        if hop_used == 256:
+            beats = beats * 2  # Scale up to 512 hop_length
+            
+    except Exception:
+        # Fallback: regular grid based on estimated tempo
+        try:
+            tempo_est = librosa.beat.tempo(y=y, sr=sr)[0]
+            beat_interval = 60.0 / max(60, min(200, tempo_est))  # Clamp to reasonable range
+        except Exception:
+            beat_interval = 0.5  # 120 BPM default
+            
+        duration = len(y) / sr
+        beat_times = np.arange(0, duration, beat_interval)
+        beats = librosa.time_to_frames(beat_times, sr=sr, hop_length=512)
+        
+    return beats.astype(int)
 
 
 def _estimate_key_from_chroma(chroma: np.ndarray) -> Tuple[str, str]:
@@ -378,29 +530,201 @@ def _estimate_key_from_chroma(chroma: np.ndarray) -> Tuple[str, str]:
     return _NOTE_NAMES_SHARP[best[1]], best[2]
 
 
-def _infer_chords_from_chroma(chroma_bs: np.ndarray) -> List[str]:
-    """Assign a simple chord label (major/minor triad) to each beat-synchronous chroma vector."""
-    # Triad templates (C major/minor) then rotate
-    major_triad = np.array([1, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0], dtype=float)  # C E G
-    minor_triad = np.array([1, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0], dtype=float)  # C Eb G
-    templates = []
-    labels = []
-    for i, name in enumerate(_NOTE_NAMES_SHARP):
-        templates.append(np.roll(major_triad, i))
-        labels.append(f"{name}")
-    for i, name in enumerate(_NOTE_NAMES_SHARP):
-        templates.append(np.roll(minor_triad, i))
-        labels.append(f"{name}m")
-    templates = np.stack(templates, axis=0)
-
+def _infer_chords_from_chroma(chroma_bs: np.ndarray, key_center: str = "C", key_mode: str = "major") -> List[str]:
+    """Enhanced chord recognition with musical context and bass focus."""
+    templates, labels = _create_weighted_templates()
+    
+    # Get diatonic chords for the key to bias recognition
+    diatonic_chords = _get_diatonic_chords(key_center, key_mode)
+    
     chords: List[str] = []
     for t in range(chroma_bs.shape[1]):
         v = chroma_bs[:, t]
-        sims = templates @ v
-        idx = int(np.argmax(sims))
+        
+        # Emphasize bass frequencies (lower indices correspond to bass in chroma)
+        bass_weight = np.array([1.2, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0])
+        v_weighted = v * bass_weight
+        
+        # Compute similarities with context bias
+        similarities = []
+        for i, template in enumerate(templates):
+            # Basic similarity
+            sim = np.dot(v_weighted, template) / (np.linalg.norm(v_weighted) * np.linalg.norm(template) + 1e-8)
+            
+            # Boost diatonic chords
+            if labels[i] in diatonic_chords:
+                sim *= 1.3
+                
+            similarities.append(sim)
+        
+        idx = int(np.argmax(similarities))
         chords.append(labels[idx])
     return chords
 
+
+def _get_diatonic_chords(key_center: str, key_mode: str) -> List[str]:
+    """Get the diatonic triads for a given key."""
+    try:
+        tonic_idx = _NOTE_NAMES_SHARP.index(key_center)
+    except ValueError:
+        return []
+    
+    if key_mode == "major":
+        # Major scale intervals and chord qualities
+        intervals = [0, 2, 4, 5, 7, 9, 11]  # Major scale
+        qualities = ["", "m", "m", "", "", "m", ""]  # I, ii, iii, IV, V, vi, vii°
+    else:
+        # Natural minor scale
+        intervals = [0, 2, 3, 5, 7, 8, 10]  # Natural minor scale  
+        qualities = ["m", "", "", "m", "m", "", ""]  # i, II, III, iv, v, VI, VII
+    
+    diatonic = []
+    for interval, quality in zip(intervals, qualities):
+        chord_root_idx = (tonic_idx + interval) % 12
+        chord_name = _NOTE_NAMES_SHARP[chord_root_idx] + quality
+        diatonic.append(chord_name)
+    
+    return diatonic
+
+
+def _apply_temporal_smoothing(chords: List[str], beats_per_bar: int) -> List[str]:
+    """Apply temporal smoothing to reduce rapid chord changes within bars."""
+    if len(chords) < beats_per_bar:
+        return chords
+    
+    smoothed = []
+    
+    # Process in bar-sized chunks
+    for i in range(0, len(chords), beats_per_bar):
+        bar_chords = chords[i:i + beats_per_bar]
+        
+        if len(bar_chords) == 0:
+            continue
+            
+        # Find the most common chord in this bar
+        chord_counts = {}
+        for chord in bar_chords:
+            chord_counts[chord] = chord_counts.get(chord, 0) + 1
+        
+        # Get the dominant chord (most frequent)
+        dominant_chord = max(chord_counts.items(), key=lambda x: x[1])[0]
+        
+        # If dominant chord appears in >50% of beats, use it for the whole bar
+        dominant_count = chord_counts[dominant_chord]
+        if dominant_count >= len(bar_chords) * 0.5:
+            smoothed.extend([dominant_chord] * len(bar_chords))
+        else:
+            # Keep original if no clear dominant chord
+            smoothed.extend(bar_chords)
+    
+    return smoothed
+
+
+def _create_weighted_templates() -> Tuple[List[np.ndarray], List[str]]:
+    """Create simple, robust chord templates focused on triads only."""
+    templates = []
+    labels = []
+    
+    for root in range(12):
+        root_name = _NOTE_NAMES_SHARP[root]
+        
+        # Major triad - simple and focused
+        maj_template = np.zeros(12, dtype=float)
+        maj_template[root] = 1.0              # Root
+        maj_template[(root + 4) % 12] = 0.6   # Major third (reduced weight)
+        maj_template[(root + 7) % 12] = 0.8   # Perfect fifth
+        templates.append(maj_template)
+        labels.append(root_name)
+        
+        # Minor triad - simple and focused
+        min_template = np.zeros(12, dtype=float) 
+        min_template[root] = 1.0              # Root
+        min_template[(root + 3) % 12] = 0.6   # Minor third (reduced weight)
+        min_template[(root + 7) % 12] = 0.8   # Perfect fifth
+        templates.append(min_template)
+        labels.append(f"{root_name}m")
+    
+    return templates, labels
+
+
+def _infer_chords_from_chroma_viterbi(chroma_bs: np.ndarray, allowed_labels: Optional[List[str]] = None) -> List[str]:
+    """HMM/Viterbi smoothing over enhanced chord templates to reduce jitter and improve consistent sections.
+
+    Uses weighted templates with harmonic content for better chord recognition.
+    Transitions: self-stay high, circle-of-fifths neighbors moderate, others low.
+    """
+    # Get enhanced templates
+    all_templates, all_labels = _create_weighted_templates()
+    
+    # Filter to allowed labels if specified
+    if allowed_labels is not None:
+        templates = []
+        labels = []
+        for i, label in enumerate(all_labels):
+            if label in allowed_labels:
+                templates.append(all_templates[i])
+                labels.append(label)
+    else:
+        templates = all_templates
+        labels = all_labels
+    
+    if not templates:
+        return []
+        
+    templates = np.stack(templates, axis=0)
+
+    T = templates.shape[0]
+    N = chroma_bs.shape[1]
+    if N == 0:
+        return []
+
+    # Emission log-likelihoods: normalize templates and vectors; use dot as similarity
+    temp_norm = templates / (np.linalg.norm(templates, axis=1, keepdims=True) + 1e-8)
+    v = chroma_bs / (np.linalg.norm(chroma_bs, axis=0, keepdims=True) + 1e-8)
+    emit = temp_norm @ v  # [T, N]
+    emit = np.clip(emit, 1e-6, 1.0)
+    log_emit = np.log(emit)
+
+    # Transition matrix in log domain
+    trans = np.full((T, T), fill_value=1e-9, dtype=float)
+    stay = 0.92
+    fifth = 0.06
+    other = 0.02 / max(1, T - 1)
+    label_to_idx = {lbl: idx for idx, lbl in enumerate(labels)}
+    for s in range(T):
+        trans[s, :] = other
+        trans[s, s] = stay
+        lbl_s = labels[s]
+        is_minor = lbl_s.endswith('m')
+        base_name = lbl_s[:-1] if is_minor else lbl_s
+        base_pc = _NOTE_NAMES_SHARP.index(base_name)
+        for neighbor_pc in ((base_pc + 7) % 12, (base_pc - 7) % 12):
+            neighbor_name = _NOTE_NAMES_SHARP[neighbor_pc]
+            neighbor_lbl = neighbor_name + ('m' if is_minor else '')
+            j = label_to_idx.get(neighbor_lbl)
+            if j is not None:
+                trans[s, j] += fifth
+        row_sum = trans[s, :].sum()
+        if row_sum > 0:
+            trans[s, :] = trans[s, :] / row_sum
+    log_trans = np.log(trans + 1e-12)
+
+    # Viterbi
+    dp = np.full((T, N), -1e9, dtype=float)
+    ptr = np.full((T, N), -1, dtype=int)
+    dp[:, 0] = log_emit[:, 0]
+    for t in range(1, N):
+        prev = dp[:, t - 1][:, None] + log_trans  # [T, T]
+        best_prev = np.argmax(prev, axis=0)
+        dp[:, t] = log_emit[:, t] + prev[best_prev, np.arange(T)]
+        ptr[:, t] = best_prev
+
+    path = np.zeros(N, dtype=int)
+    path[-1] = int(np.argmax(dp[:, -1]))
+    for t in range(N - 2, -1, -1):
+        path[t] = ptr[path[t + 1], t + 1]
+
+    return [labels[int(s)] for s in path]
 
 def _collapse_repeats(seq: List[str]) -> List[str]:
     out: List[str] = []
@@ -521,6 +845,44 @@ def _select_bars_per_phrase(tokens: List[str], beats_per_bar: int, candidates: T
             best_score = score
             best_bp = bars
     return best_bp
+
+
+def _aggregate_to_bars(beat_chords: List[str], beats_per_bar: int) -> List[str]:
+    if beats_per_bar <= 0:
+        beats_per_bar = 4
+    n = len(beat_chords)
+    if n == 0:
+        return []
+    bars: List[str] = []
+    for i in range(0, n, beats_per_bar):
+        seg = beat_chords[i:i+beats_per_bar]
+        if not seg:
+            continue
+        # majority root across beats in bar
+        counts = {}
+        for ch in seg:
+            root = ch[0].upper() + (ch[1] if len(ch) > 1 and ch[1] in ['#', 'b'] else '')
+            counts[root] = counts.get(root, 0) + 1
+        root = sorted(counts.items(), key=lambda x: (-x[1], x[0]))[0][0]
+        bars.append(root)
+    return bars
+
+
+def _topk_roots(chords: List[str], k: int = 3) -> List[str]:
+    counts = {}
+    for ch in chords:
+        root = ch[0].upper() + (ch[1] if len(ch) > 1 and ch[1] in ['#', 'b'] else '')
+        counts[root] = counts.get(root, 0) + 1
+    ordered = sorted(counts.items(), key=lambda x: (-x[1], x[0]))
+    return [c for c, _ in ordered[:k]]
+
+
+def _topk_tokens(tokens: List[str], k: int = 3) -> List[str]:
+    counts = {}
+    for t in tokens:
+        counts[t] = counts.get(t, 0) + 1
+    ordered = sorted(counts.items(), key=lambda x: (-x[1], x[0]))
+    return [c for c, _ in ordered[:k]]
 
 def _infer_form_from_chords(beat_chords: List[str], phrase_len: int = 4, similarity_threshold: float = 0.6) -> List[str]:
     """Form labeling with fuzzy matching over phrases of length phrase_len.
