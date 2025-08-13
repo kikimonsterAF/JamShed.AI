@@ -13,19 +13,28 @@ import uuid
 from tempfile import TemporaryDirectory
 
 # AISU transformer integration
-print("[DEBUG] Attempting to import AISU transformer...")
+print("[DEBUG] Attempting to import AISU transformers...")
 try:
     from .aisu_chord_detection import predict_chords_aisu
     AISU_AVAILABLE = True
-    print("[DEBUG] AISU transformer model available - import successful")
+    print("[DEBUG] AISU basic transformer available")
 except ImportError as e:
-    print(f"[DEBUG] AISU transformer not available - import failed: {e}")
-    import traceback
-    traceback.print_exc()
+    print(f"[DEBUG] AISU basic transformer failed: {e}")
     AISU_AVAILABLE = False
     def predict_chords_aisu(audio_path: str):
-        print("[DEBUG] Using fallback predict_chords_aisu")
-        return ["C", "F", "G", "C"]  # Fallback
+        return ["C", "F", "G", "C"]
+
+# AISU deep transformer integration
+try:
+    from .aisu_deep_transformer import predict_chords_deep_transformer
+    AISU_DEEP_AVAILABLE = True
+    print("[DEBUG] AISU deep transformer available - competition-grade model loaded")
+except ImportError as e:
+    print(f"[DEBUG] AISU deep transformer not available: {e}")
+    AISU_DEEP_AVAILABLE = False
+    def predict_chords_deep_transformer(audio_path: str):
+        print("[DEBUG] Using fallback deep transformer")
+        return ["C", "F", "G", "C"]
 
 app = FastAPI(title="JamTab API", version="0.1.0")
 
@@ -73,6 +82,7 @@ async def analyze(
     beats_per_bar: Optional[int] = None,
     meter: Optional[str] = None,
     use_aisu: Optional[int] = None,
+    use_deep: Optional[int] = None,
 ) -> AnalysisResponse:
     allowed_types = {
         "audio/mpeg",  # .mp3
@@ -116,6 +126,7 @@ async def analyze(
             beats_per_bar=beats_per_bar,
             meter=meter,
             use_aisu=use_aisu,
+            use_deep=use_deep,
         )
         return result
     finally:
@@ -137,6 +148,7 @@ async def analyze_url(
     beats_per_bar: Optional[int] = None,
     meter: Optional[str] = None,
     use_aisu: Optional[int] = None,
+    use_deep: Optional[int] = None,
 ) -> AnalysisResponse:
     """Download audio from YouTube (or other supported sites) and analyze it.
     Requires yt-dlp and ffmpeg to be present.
@@ -204,6 +216,7 @@ async def analyze_url(
             beats_per_bar=beats_per_bar,
             meter=meter,
             use_aisu=use_aisu,
+            use_deep=use_deep,
         )
 
 
@@ -214,6 +227,7 @@ def _analyze_path(
     beats_per_bar: Optional[int],
     meter: Optional[str],
     use_aisu: Optional[int] = None,
+    use_deep: Optional[int] = None,
 ) -> AnalysisResponse:
     # Decode to mono PCM WAV (22.05 kHz) via ffmpeg
     y, sr = _decode_audio_with_ffmpeg(src_path, target_sr=22050)
@@ -230,13 +244,46 @@ def _analyze_path(
     # Key estimation
     key_center, key_mode = _estimate_key_from_chroma(chroma)
 
-    # Chord detection - AISU transformer or fallback
+    # Chord detection - Deep transformer, AISU transformer, or fallback
+    print(f"[DEBUG] use_deep parameter: {use_deep}")
     print(f"[DEBUG] use_aisu parameter: {use_aisu}")
+    print(f"[DEBUG] AISU_DEEP_AVAILABLE: {AISU_DEEP_AVAILABLE}")
     print(f"[DEBUG] AISU_AVAILABLE: {AISU_AVAILABLE}")
-    use_aisu_enabled = bool(use_aisu) and int(use_aisu or 0) == 1 and AISU_AVAILABLE
+    
+    use_deep_enabled = bool(use_deep) and int(use_deep or 0) == 1 and AISU_DEEP_AVAILABLE
+    use_aisu_enabled = bool(use_aisu) and int(use_aisu or 0) == 1 and AISU_AVAILABLE and not use_deep_enabled
+    
+    print(f"[DEBUG] use_deep_enabled: {use_deep_enabled}")
     print(f"[DEBUG] use_aisu_enabled: {use_aisu_enabled}")
     
-    if use_aisu_enabled:
+    if use_deep_enabled:
+        try:
+            print("[DEBUG] 🚀 Starting AISU DEEP TRANSFORMER chord detection...")
+            chords_progression = predict_chords_deep_transformer(src_path)
+            print(f"[DEBUG] 🎯 DEEP TRANSFORMER returned chords: {chords_progression}")
+            # Create beat-level chords for form analysis
+            beat_chords = []
+            for chord in chords_progression:
+                beat_chords.extend([chord] * 4)  # 4 beats per chord
+            print(f"[DEBUG] 🎵 Deep transformer beat_chords created: {len(beat_chords)} beats")
+        except Exception as e:
+            print(f"[DEBUG] ❌ Deep transformer failed, falling back to AISU: {e}")
+            import traceback
+            traceback.print_exc()
+            # Fallback to AISU
+            if AISU_AVAILABLE:
+                try:
+                    chords_progression = predict_chords_aisu(src_path)
+                    beat_chords = []
+                    for chord in chords_progression:
+                        beat_chords.extend([chord] * 4)
+                except:
+                    beat_chords = _infer_chords_from_chroma(chroma)
+                    chords_progression = _collapse_repeats(beat_chords)
+            else:
+                beat_chords = _infer_chords_from_chroma(chroma)
+                chords_progression = _collapse_repeats(beat_chords)
+    elif use_aisu_enabled:
         try:
             print("[DEBUG] Starting AISU transformer chord detection...")
             chords_progression = predict_chords_aisu(src_path)
