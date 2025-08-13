@@ -11,4 +11,8 @@ scipy==1.11.4
 soundfile==0.12.1
 ffmpeg-python==0.2.0
 yt-dlp
+# AISU transformer model dependencies
+torch>=1.9.0
+madmom>=0.16.1
+tensorflow>=2.4.0
 

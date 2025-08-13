@@ -12,6 +12,21 @@ import librosa
 import uuid
 from tempfile import TemporaryDirectory
 
+# AISU transformer integration
+print("[DEBUG] Attempting to import AISU transformer...")
+try:
+    from .aisu_chord_detection import predict_chords_aisu
+    AISU_AVAILABLE = True
+    print("[DEBUG] AISU transformer model available - import successful")
+except ImportError as e:
+    print(f"[DEBUG] AISU transformer not available - import failed: {e}")
+    import traceback
+    traceback.print_exc()
+    AISU_AVAILABLE = False
+    def predict_chords_aisu(audio_path: str):
+        print("[DEBUG] Using fallback predict_chords_aisu")
+        return ["C", "F", "G", "C"]  # Fallback
+
 app = FastAPI(title="JamTab API", version="0.1.0")
 
 
@@ -57,6 +72,7 @@ async def analyze(
     difficulty: Optional[str] = None,
     beats_per_bar: Optional[int] = None,
     meter: Optional[str] = None,
+    use_aisu: Optional[int] = None,
 ) -> AnalysisResponse:
     allowed_types = {
         "audio/mpeg",  # .mp3
@@ -99,6 +115,7 @@ async def analyze(
             difficulty=difficulty,
             beats_per_bar=beats_per_bar,
             meter=meter,
+            use_aisu=use_aisu,
         )
         return result
     finally:
@@ -119,6 +136,7 @@ async def analyze_url(
     difficulty: Optional[str] = None,
     beats_per_bar: Optional[int] = None,
     meter: Optional[str] = None,
+    use_aisu: Optional[int] = None,
 ) -> AnalysisResponse:
     """Download audio from YouTube (or other supported sites) and analyze it.
     Requires yt-dlp and ffmpeg to be present.
@@ -185,6 +203,7 @@ async def analyze_url(
             difficulty=difficulty,
             beats_per_bar=beats_per_bar,
             meter=meter,
+            use_aisu=use_aisu,
         )
 
 
@@ -194,6 +213,7 @@ def _analyze_path(
     difficulty: Optional[str],
     beats_per_bar: Optional[int],
     meter: Optional[str],
+    use_aisu: Optional[int] = None,
 ) -> AnalysisResponse:
     # Decode to mono PCM WAV (22.05 kHz) via ffmpeg
     y, sr = _decode_audio_with_ffmpeg(src_path, target_sr=22050)
@@ -210,9 +230,36 @@ def _analyze_path(
     # Key estimation
     key_center, key_mode = _estimate_key_from_chroma(chroma)
 
-    # Chords and collapsed progression
-    beat_chords = _infer_chords_from_chroma(chroma)
-    chords_progression = _collapse_repeats(beat_chords)
+    # Chord detection - AISU transformer or fallback
+    print(f"[DEBUG] use_aisu parameter: {use_aisu}")
+    print(f"[DEBUG] AISU_AVAILABLE: {AISU_AVAILABLE}")
+    use_aisu_enabled = bool(use_aisu) and int(use_aisu or 0) == 1 and AISU_AVAILABLE
+    print(f"[DEBUG] use_aisu_enabled: {use_aisu_enabled}")
+    
+    if use_aisu_enabled:
+        try:
+            print("[DEBUG] Starting AISU transformer chord detection...")
+            chords_progression = predict_chords_aisu(src_path)
+            print(f"[DEBUG] AISU returned chords: {chords_progression}")
+            # Create beat-level chords for form analysis (repeat each chord 4 times for 4/4)
+            beat_chords = []
+            for chord in chords_progression:
+                beat_chords.extend([chord] * 4)  # 4 beats per chord
+            print(f"[DEBUG] AISU beat_chords created: {len(beat_chords)} beats")
+        except Exception as e:
+            print(f"[DEBUG] AISU chord detection failed, falling back: {e}")
+            import traceback
+            traceback.print_exc()
+            # Fallback to original method
+            beat_chords = _infer_chords_from_chroma(chroma)
+            chords_progression = _collapse_repeats(beat_chords)
+            print(f"[DEBUG] Fallback chords: {chords_progression}")
+    else:
+        print("[DEBUG] Using original chord detection method")
+        # Original chord detection method
+        beat_chords = _infer_chords_from_chroma(chroma)
+        chords_progression = _collapse_repeats(beat_chords)
+        print(f"[DEBUG] Original method chords: {chords_progression}")
 
     # Select phrase length (user override or auto)
     user_bpb: Optional[int] = None

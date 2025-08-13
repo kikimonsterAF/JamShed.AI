@@ -1,9 +1,19 @@
+# Competition data
+official_data
+customized_data
+*.zip
 
-# Ignore Python/venv and Flutter build
-server/.venv/
-**/.DS_Store
-**/.idea/
-**/.vscode/
-mobile/build/
-**/.dart_tool/
-**/build/
+# Environments: Virtualenv for Windows
+venv4W
+# Environments: Virtualenv for Linux
+venv4L
+
+# Codes
+test
+*.pyc
+
+# Models & Checkpoints
+*.h5
+checkpoint
+ckpt-*
+attns_*.png
