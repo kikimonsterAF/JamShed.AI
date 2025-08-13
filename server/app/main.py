@@ -344,7 +344,7 @@ def _analyze_path(
 
     meter_label = f"{selected_bpb}/4" if selected_bpb else None
     return AnalysisResponse(
-        chords=chords_progression[:16],
+        chords=chords_progression,
         form=form_labels[:8],
         scale_suggestions=suggestions,
         beats_per_bar=selected_bpb,

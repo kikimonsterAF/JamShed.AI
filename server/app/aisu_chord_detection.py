@@ -198,71 +198,103 @@ def _apply_i_iv_v_bias_aisu(chords: List[str]) -> List[str]:
         
         print(f"[DEBUG] AISU detected key center: {key_center}")
         
-        # Calculate I-IV-V for this key
+        # Calculate full diatonic chords for this key
         note_names = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
         if key_center in note_names:
             tonic_idx = note_names.index(key_center)
             i_chord = key_center  # I
+            ii_chord = note_names[(tonic_idx + 2) % 12] + 'm'  # ii minor  
+            iii_chord = note_names[(tonic_idx + 4) % 12] + 'm'  # iii minor
             iv_chord = note_names[(tonic_idx + 5) % 12]  # IV
             v_chord = note_names[(tonic_idx + 7) % 12]  # V
+            vi_chord = note_names[(tonic_idx + 9) % 12] + 'm'  # vi minor
             
-            print(f"[DEBUG] AISU I-IV-V chords: I={i_chord}, IV={iv_chord}, V={v_chord}")
+            print(f"[DEBUG] AISU diatonic chords: I={i_chord}, ii={ii_chord}, iii={iii_chord}, IV={iv_chord}, V={v_chord}, vi={vi_chord}")
             
             # Apply intelligent mapping
             biased_chords = []
             for chord in chords:
                 root = chord.replace('m', '').replace('7', '').replace('maj', '').replace('dim', '').replace('aug', '')
                 
-                # Direct matches
+                # Smart diatonic matching - prefer I-IV-V-vi but allow ii-iii when present
                 if root == i_chord or _are_enharmonic_aisu(root, i_chord):
                     biased_chords.append(i_chord)
                 elif root == iv_chord or _are_enharmonic_aisu(root, iv_chord):
                     biased_chords.append(iv_chord)
                 elif root == v_chord or _are_enharmonic_aisu(root, v_chord):
                     biased_chords.append(v_chord)
+                elif chord == vi_chord or (root == vi_chord.replace('m', '') and 'm' in chord):
+                    biased_chords.append(vi_chord)
+                elif chord == ii_chord or (root == ii_chord.replace('m', '') and 'm' in chord):
+                    biased_chords.append(ii_chord)
+                elif chord == iii_chord or (root == iii_chord.replace('m', '') and 'm' in chord):
+                    biased_chords.append(iii_chord)
                 else:
-                    # Special mappings for A# major I-IV-V
+                    # Fallback to harmonic distance mapping for non-diatonic chords
                     if key_center == 'A#':
-                        if chord == 'Cm':
-                            print(f"[DEBUG] AISU mapping Cm -> F (V chord)")
-                            biased_chords.append('F')
-                        elif chord == 'Am':
-                            print(f"[DEBUG] AISU mapping Am -> F (V chord)")
-                            biased_chords.append('F')
-                        elif chord == 'A#m':
-                            print(f"[DEBUG] AISU mapping A#m -> A# (I chord)")
+                        # Special cases for A# major that don't fit standard diatonic pattern
+                        if chord == 'A#m':
+                            print(f"[DEBUG] AISU mapping A#m -> A# (I chord - remove minor quality)")
                             biased_chords.append('A#')
                         elif chord in ['C#7', 'C#']:
                             print(f"[DEBUG] AISU mapping C#7/C# -> D# (IV chord)")
                             biased_chords.append('D#')
                         else:
-                            # Use harmonic distance mapping for unspecified chords
+                            # Use harmonic distance mapping for unspecified chords (full diatonic)
                             if root in note_names:
                                 root_idx = note_names.index(root)
-                                # Distance to I, IV, V
+                                ii_root_idx = (tonic_idx + 2) % 12
+                                iii_root_idx = (tonic_idx + 4) % 12
+                                vi_root_idx = (tonic_idx + 9) % 12
+                                
+                                # Distance to all diatonic chords
                                 dist_to_i = min(abs(root_idx - tonic_idx), 12 - abs(root_idx - tonic_idx))
+                                dist_to_ii = min(abs(root_idx - ii_root_idx), 12 - abs(root_idx - ii_root_idx))
+                                dist_to_iii = min(abs(root_idx - iii_root_idx), 12 - abs(root_idx - iii_root_idx))
                                 dist_to_iv = min(abs(root_idx - (tonic_idx + 5) % 12), 12 - abs(root_idx - (tonic_idx + 5) % 12))
                                 dist_to_v = min(abs(root_idx - (tonic_idx + 7) % 12), 12 - abs(root_idx - (tonic_idx + 7) % 12))
+                                dist_to_vi = min(abs(root_idx - vi_root_idx), 12 - abs(root_idx - vi_root_idx))
                                 
-                                # Choose closest
-                                distances = [(dist_to_i, i_chord), (dist_to_iv, iv_chord), (dist_to_v, v_chord)]
-                                closest = min(distances)[1]
-                                biased_chords.append(closest)
+                                # Smart mapping: respect chord quality and prefer primary chords
+                                if 'm' in chord:
+                                    # For minor chords, prefer vi, then ii, then iii
+                                    minor_distances = [(dist_to_vi, vi_chord), (dist_to_ii, ii_chord), (dist_to_iii, iii_chord)]
+                                    closest_minor = min(minor_distances)[1]
+                                    biased_chords.append(closest_minor)
+                                else:
+                                    # For major chords, prefer I, IV, V
+                                    major_distances = [(dist_to_i, i_chord), (dist_to_iv, iv_chord), (dist_to_v, v_chord)]
+                                    closest_major = min(major_distances)[1]
+                                    biased_chords.append(closest_major)
                             else:
                                 biased_chords.append(i_chord)  # Default to tonic
                     else:
-                        # For non-A# keys, use general harmonic distance mapping
+                        # For non-A# keys, use general harmonic distance mapping (full diatonic)
                         if root in note_names:
                             root_idx = note_names.index(root)
-                            # Distance to I, IV, V
+                            ii_root_idx = (tonic_idx + 2) % 12
+                            iii_root_idx = (tonic_idx + 4) % 12
+                            vi_root_idx = (tonic_idx + 9) % 12
+                            
+                            # Distance to all diatonic chords
                             dist_to_i = min(abs(root_idx - tonic_idx), 12 - abs(root_idx - tonic_idx))
+                            dist_to_ii = min(abs(root_idx - ii_root_idx), 12 - abs(root_idx - ii_root_idx))
+                            dist_to_iii = min(abs(root_idx - iii_root_idx), 12 - abs(root_idx - iii_root_idx))
                             dist_to_iv = min(abs(root_idx - (tonic_idx + 5) % 12), 12 - abs(root_idx - (tonic_idx + 5) % 12))
                             dist_to_v = min(abs(root_idx - (tonic_idx + 7) % 12), 12 - abs(root_idx - (tonic_idx + 7) % 12))
+                            dist_to_vi = min(abs(root_idx - vi_root_idx), 12 - abs(root_idx - vi_root_idx))
                             
-                            # Choose closest
-                            distances = [(dist_to_i, i_chord), (dist_to_iv, iv_chord), (dist_to_v, v_chord)]
-                            closest = min(distances)[1]
-                            biased_chords.append(closest)
+                            # Smart mapping: respect chord quality and prefer primary chords
+                            if 'm' in chord:
+                                # For minor chords, prefer vi, then ii, then iii
+                                minor_distances = [(dist_to_vi, vi_chord), (dist_to_ii, ii_chord), (dist_to_iii, iii_chord)]
+                                closest_minor = min(minor_distances)[1]
+                                biased_chords.append(closest_minor)
+                            else:
+                                # For major chords, prefer I, IV, V
+                                major_distances = [(dist_to_i, i_chord), (dist_to_iv, iv_chord), (dist_to_v, v_chord)]
+                                closest_major = min(major_distances)[1]
+                                biased_chords.append(closest_major)
                         else:
                             biased_chords.append(i_chord)  # Default to tonic
             
@@ -308,9 +340,11 @@ def predict_chords_aisu(audio_path: str) -> List[str]:
         
         # Beat tracking for temporal alignment
         tempo, beats = librosa.beat.beat_track(y=y, sr=sr, hop_length=512)
+        print(f"[DEBUG] AISU audio duration: {len(y)/sr:.1f}s, detected {len(beats)} beats, tempo: {float(tempo):.1f} BPM")
         
         # Sync chroma to beats
         chroma_sync = librosa.util.sync(chroma_cqt, beats)
+        print(f"[DEBUG] AISU chroma_sync shape: {chroma_sync.shape} - processing {chroma_sync.shape[1]} beat segments")
         
         # Enhanced chord recognition with AISU-inspired templates
         chord_names = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
@@ -383,6 +417,7 @@ def predict_chords_aisu(audio_path: str) -> List[str]:
             i += count
         
         # 3. Apply I-IV-V bias for simple songs
+        print(f"[DEBUG] AISU raw chords before bias: {final_chords[:20]}")  # Show first 20 raw chords
         i_iv_v_chords = _apply_i_iv_v_bias_aisu(final_chords)
         
         # Ensure we have a reasonable progression
@@ -396,7 +431,7 @@ def predict_chords_aisu(audio_path: str) -> List[str]:
             else:
                 i_iv_v_chords = [chord, chord, chord, chord]
         
-        result = i_iv_v_chords[:16]  # Limit to 16 chords
+        result = i_iv_v_chords  # Return full song progression
         print(f"AISU detected chords: {result}")
         return result
         
