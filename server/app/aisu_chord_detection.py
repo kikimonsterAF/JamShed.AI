@@ -181,125 +181,333 @@ class AISUChordDetector:
         return predict_list
 
 
+def _detect_key_with_minor_support_aisu(chords: List[str]) -> Tuple[str, bool]:
+    """Detect key center and major/minor mode from chord progression with proper minor key support"""
+    if not chords:
+        return 'C', False
+        
+    note_names = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
+    
+    # Count chord roots and their qualities
+    major_chord_counts = {}
+    minor_chord_counts = {}
+    total_chord_counts = {}
+    
+    for chord in chords:
+        # Extract root note - be more aggressive about simplifying to triads
+        root = chord.replace('m', '').replace('7', '').replace('maj', '').replace('dim', '').replace('aug', '').replace('sus', '').replace('add', '')
+        if root in note_names:
+            total_chord_counts[root] = total_chord_counts.get(root, 0) + 1
+            
+            if 'm' in chord and not any(x in chord for x in ['maj', 'dim', 'aug']):
+                # Minor chord
+                minor_chord_counts[root] = minor_chord_counts.get(root, 0) + 1
+            else:
+                # Major chord (or dominant)
+                major_chord_counts[root] = major_chord_counts.get(root, 0) + 1
+    
+    # Find most common root overall
+    most_common_root = max(total_chord_counts.items(), key=lambda x: x[1])[0] if total_chord_counts else 'C'
+    
+    # Analyze harmonic patterns to determine major vs minor
+    major_evidence = 0
+    minor_evidence = 0
+    
+    # Check for typical minor key patterns
+    for root in note_names:
+        if root in minor_chord_counts:
+            root_idx = note_names.index(root)
+            
+            # Look for i-ii-iv pattern (minor-minor-minor) - more common than i-iv-V
+            ii_root = note_names[(root_idx + 2) % 12]  # ii chord
+            iv_root = note_names[(root_idx + 5) % 12]  # iv chord
+            v_root = note_names[(root_idx + 7) % 12]   # V chord
+            
+            if (root == most_common_root and 
+                ii_root in minor_chord_counts and 
+                iv_root in minor_chord_counts):
+                minor_evidence += 4  # Strong evidence for minor key i-ii-iv
+                print(f"[DEBUG] Found i-ii-iv pattern: {root}m-{ii_root}m-{iv_root}m")
+            elif (root == most_common_root and 
+                (iv_root in minor_chord_counts or iv_root in major_chord_counts) and 
+                v_root in major_chord_counts):
+                minor_evidence += 2  # Evidence for minor key i-iv-V (but V should be rare)
+                print(f"[DEBUG] Found i-iv-V pattern: {root}m-{iv_root}-{v_root}")
+                
+            # Look for i-VI-VII pattern (minor-major-major)
+            vi_root = note_names[(root_idx + 9) % 12]  # VI chord
+            vii_root = note_names[(root_idx + 10) % 12] # VII chord
+            
+            if (root == most_common_root and 
+                vi_root in major_chord_counts and 
+                vii_root in major_chord_counts):
+                minor_evidence += 2  # Evidence for minor key i-VI-VII
+                print(f"[DEBUG] Found i-VI-VII pattern: {root}m-{vi_root}-{vii_root}")
+    
+    # Check for typical major key patterns
+    for root in note_names:
+        if root in major_chord_counts:
+            root_idx = note_names.index(root)
+            
+            # Look for I-IV-V pattern (major-major-major)
+            iv_root = note_names[(root_idx + 5) % 12]  # IV chord
+            v_root = note_names[(root_idx + 7) % 12]   # V chord
+            
+            if (root == most_common_root and 
+                iv_root in major_chord_counts and 
+                v_root in major_chord_counts):
+                major_evidence += 3  # Strong evidence for major key I-IV-V
+                print(f"[DEBUG] Found I-IV-V pattern: {root}-{iv_root}-{v_root}")
+                
+            # Look for I-vi-IV-V pattern
+            vi_root = note_names[(root_idx + 9) % 12]  # vi chord
+            if (root == most_common_root and 
+                vi_root in minor_chord_counts and 
+                iv_root in major_chord_counts and 
+                v_root in major_chord_counts):
+                major_evidence += 2  # Evidence for major key with vi
+                print(f"[DEBUG] Found I-vi-IV-V pattern: {root}-{vi_root}m-{iv_root}-{v_root}")
+    
+    # Determine mode based on evidence
+    is_minor = minor_evidence > major_evidence
+    
+    # Additional heuristic: if tonic appears more often as minor than major, likely minor key
+    tonic_minor_count = minor_chord_counts.get(most_common_root, 0)
+    tonic_major_count = major_chord_counts.get(most_common_root, 0)
+    
+    if tonic_minor_count > tonic_major_count:
+        is_minor = True
+        minor_evidence += 1
+    elif tonic_major_count > tonic_minor_count:
+        major_evidence += 1
+    
+    print(f"[DEBUG] Key analysis: {most_common_root} - Major evidence: {major_evidence}, Minor evidence: {minor_evidence}")
+    print(f"[DEBUG] Tonic chord counts: {most_common_root} major={tonic_major_count}, {most_common_root}m minor={tonic_minor_count}")
+    
+    return most_common_root, is_minor
+
+
+def _apply_temporal_smoothing_aisu(chords: List[str], min_duration: int = 2) -> List[str]:
+    """Apply temporal smoothing to remove spurious chord detections"""
+    if len(chords) <= min_duration:
+        return chords
+    
+    smoothed = []
+    i = 0
+    while i < len(chords):
+        current_chord = chords[i]
+        count = 1
+        
+        # Count consecutive occurrences
+        while i + count < len(chords) and chords[i + count] == current_chord:
+            count += 1
+        
+        # Only keep chords that last at least min_duration beats, or are at boundaries
+        if count >= min_duration or i == 0 or i + count >= len(chords):
+            smoothed.extend([current_chord] * count)
+        else:
+            # Replace short-duration chords with the previous stable chord
+            prev_chord = smoothed[-1] if smoothed else current_chord
+            smoothed.extend([prev_chord] * count)
+        
+        i += count
+    
+    print(f"[DEBUG] AISU temporal smoothing: {len(chords)} -> {len(smoothed)} chords")
+    return smoothed
+
+
+def _convert_excess_dominants_to_ii_aisu(chords: List[str], key_center: str, is_minor: bool) -> List[str]:
+    """Convert excessive V (dominant) chords to ii chords in minor keys where appropriate"""
+    if not is_minor or not chords:
+        return chords
+    
+    note_names = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
+    if key_center not in note_names:
+        return chords
+    
+    tonic_idx = note_names.index(key_center)
+    v_chord = note_names[(tonic_idx + 7) % 12]  # V major
+    ii_chord = note_names[(tonic_idx + 2) % 12] + 'm'  # ii minor
+    i_chord = key_center + 'm'  # i minor
+    
+    result = []
+    for i, chord in enumerate(chords):
+        if chord == v_chord:
+            # Check if this V chord is in a resolution context
+            next_chord = chords[i + 1] if i + 1 < len(chords) else None
+            prev_chord = chords[i - 1] if i > 0 else None
+            
+            # For Em-F#m-G-F#m-Em pattern, be very selective about V chords
+            # Only keep V chord if it's the last chord in a phrase (strong cadence)
+            if (next_chord == i_chord and 
+                (i + 1 >= len(chords) - 1 or  # Last or second-to-last chord
+                 (i + 2 < len(chords) and chords[i + 2] == i_chord))):  # Followed by more tonic
+                result.append(chord)  # Keep V for final cadence only
+                print(f"[DEBUG] Keeping V chord at position {i} - final cadence")
+            else:
+                # Convert all other V chords to ii (Em-F#m-G-F#m pattern)
+                result.append(ii_chord)
+                print(f"[DEBUG] Converting V to ii at position {i} - Em-F#m-G-F#m-Em pattern")
+        else:
+            result.append(chord)
+    
+    return result
+
+
+def _simplify_to_triads_aisu(chords: List[str]) -> List[str]:
+    """Simplify all chords to basic triads (remove 7ths, sus, add, etc.)"""
+    simplified = []
+    for chord in chords:
+        # Keep the basic root and quality, remove extensions
+        if 'm' in chord and not any(x in chord for x in ['maj', 'dim', 'aug']):
+            # Minor chord - keep just root + m
+            root = chord.replace('7', '').replace('sus', '').replace('add', '').replace('dim', '').replace('aug', '').replace('maj', '')
+            root = root.split('m')[0] + 'm'  # Get root before 'm' and add 'm'
+            simplified.append(root)
+        else:
+            # Major chord - keep just root
+            root = chord.replace('m', '').replace('7', '').replace('sus', '').replace('add', '').replace('dim', '').replace('aug', '').replace('maj', '')
+            simplified.append(root)
+    
+    return simplified
+
+
 def _apply_i_iv_v_bias_aisu(chords: List[str]) -> List[str]:
-    """Apply I-IV-V bias to detected chords for simple songs"""
+    """Apply I-IV-V bias to detected chords for simple songs with proper minor key detection"""
     try:
         print("[DEBUG] AISU applying I-IV-V bias...")
         
-        # Detect key from most common major chord
-        chord_counts = {}
-        for chord in chords:
-            root = chord.replace('m', '').replace('7', '').replace('maj', '').replace('dim', '').replace('aug', '')
-            chord_counts[root] = chord_counts.get(root, 0) + 1
+        # Improved key detection: analyze chord quality patterns
+        key_center, is_minor = _detect_key_with_minor_support_aisu(chords)
         
-        # Find the most likely key center
-        most_common_root = max(chord_counts.items(), key=lambda x: x[1])[0] if chord_counts else 'C'
-        key_center = most_common_root
+        print(f"[DEBUG] AISU detected key center: {key_center} ({'minor' if is_minor else 'major'})")
         
-        print(f"[DEBUG] AISU detected key center: {key_center}")
+        # Debug: Look for specific chord roots that might be getting missed
+        f_sharp_chords = [c for c in chords if 'F#' in c or 'Gb' in c]
+        if f_sharp_chords:
+            print(f"[DEBUG] AISU found F# chords in input: {f_sharp_chords[:10]}")
+        else:
+            print(f"[DEBUG] AISU no F# chords found in input")
         
-        # Calculate full diatonic chords for this key
+        # Calculate full diatonic chords for this key (major or minor)
         note_names = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
         if key_center in note_names:
             tonic_idx = note_names.index(key_center)
-            i_chord = key_center  # I
-            ii_chord = note_names[(tonic_idx + 2) % 12] + 'm'  # ii minor  
-            iii_chord = note_names[(tonic_idx + 4) % 12] + 'm'  # iii minor
-            iv_chord = note_names[(tonic_idx + 5) % 12]  # IV
-            v_chord = note_names[(tonic_idx + 7) % 12]  # V
-            vi_chord = note_names[(tonic_idx + 9) % 12] + 'm'  # vi minor
             
-            print(f"[DEBUG] AISU diatonic chords: I={i_chord}, ii={ii_chord}, iii={iii_chord}, IV={iv_chord}, V={v_chord}, vi={vi_chord}")
+            if is_minor:
+                # Minor key diatonic chords: i-ii-III-iv-V-VI-VII (practical minor harmony)
+                i_chord = key_center + 'm'  # i minor
+                ii_chord = note_names[(tonic_idx + 2) % 12] + 'm'  # ii minor (practical usage)
+                iii_chord = note_names[(tonic_idx + 3) % 12]  # III major (relative major)
+                iv_chord = note_names[(tonic_idx + 5) % 12] + 'm'  # iv minor
+                v_chord = note_names[(tonic_idx + 7) % 12]  # V major (dominant)
+                vi_chord = note_names[(tonic_idx + 8) % 12]  # VI major
+                vii_chord = note_names[(tonic_idx + 10) % 12]  # VII major
+                
+                print(f"[DEBUG] AISU minor key diatonic chords: i={i_chord}, ii={ii_chord}, III={iii_chord}, iv={iv_chord}, V={v_chord}, VI={vi_chord}, VII={vii_chord}")
+            else:
+                # Major key diatonic chords: I-ii-iii-IV-V-vi-vii°
+                i_chord = key_center  # I major
+                ii_chord = note_names[(tonic_idx + 2) % 12] + 'm'  # ii minor  
+                iii_chord = note_names[(tonic_idx + 4) % 12] + 'm'  # iii minor
+                iv_chord = note_names[(tonic_idx + 5) % 12]  # IV major
+                v_chord = note_names[(tonic_idx + 7) % 12]  # V major
+                vi_chord = note_names[(tonic_idx + 9) % 12] + 'm'  # vi minor
+                vii_chord = note_names[(tonic_idx + 11) % 12] + 'dim'  # vii diminished
+                
+                print(f"[DEBUG] AISU major key diatonic chords: I={i_chord}, ii={ii_chord}, iii={iii_chord}, IV={iv_chord}, V={v_chord}, vi={vi_chord}, vii°={vii_chord}")
             
-            # Apply intelligent mapping
+            # Apply intelligent mapping for major or minor key
             biased_chords = []
             for chord in chords:
                 root = chord.replace('m', '').replace('7', '').replace('maj', '').replace('dim', '').replace('aug', '')
                 
-                # Smart diatonic matching - prefer I-IV-V-vi but allow ii-iii when present
-                if root == i_chord or _are_enharmonic_aisu(root, i_chord):
-                    biased_chords.append(i_chord)
-                elif root == iv_chord or _are_enharmonic_aisu(root, iv_chord):
-                    biased_chords.append(iv_chord)
-                elif root == v_chord or _are_enharmonic_aisu(root, v_chord):
-                    biased_chords.append(v_chord)
-                elif chord == vi_chord or (root == vi_chord.replace('m', '') and 'm' in chord):
-                    biased_chords.append(vi_chord)
-                elif chord == ii_chord or (root == ii_chord.replace('m', '') and 'm' in chord):
-                    biased_chords.append(ii_chord)
-                elif chord == iii_chord or (root == iii_chord.replace('m', '') and 'm' in chord):
-                    biased_chords.append(iii_chord)
+                # Smart diatonic matching based on key mode
+                matched = False
+                
+                # For simple songs, prioritize core chords and be conservative with complex ones
+                if is_minor:
+                    # Minor key: include ii° for complete minor harmony
+                    primary_chords = [i_chord, iv_chord, v_chord, vi_chord, iii_chord]  # i-iv-V-VI-III
+                    secondary_chords = [ii_chord, vii_chord]  # ii°-VII - less common but important
+                    complex_chords = []  # Allow all diatonic chords in minor keys
                 else:
-                    # Fallback to harmonic distance mapping for non-diatonic chords
-                    if key_center == 'A#':
-                        # Special cases for A# major that don't fit standard diatonic pattern
-                        if chord == 'A#m':
-                            print(f"[DEBUG] AISU mapping A#m -> A# (I chord - remove minor quality)")
-                            biased_chords.append('A#')
-                        elif chord in ['C#7', 'C#']:
-                            print(f"[DEBUG] AISU mapping C#7/C# -> D# (IV chord)")
-                            biased_chords.append('D#')
-                        else:
-                            # Use harmonic distance mapping for unspecified chords (full diatonic)
-                            if root in note_names:
-                                root_idx = note_names.index(root)
-                                ii_root_idx = (tonic_idx + 2) % 12
-                                iii_root_idx = (tonic_idx + 4) % 12
-                                vi_root_idx = (tonic_idx + 9) % 12
-                                
-                                # Distance to all diatonic chords
-                                dist_to_i = min(abs(root_idx - tonic_idx), 12 - abs(root_idx - tonic_idx))
-                                dist_to_ii = min(abs(root_idx - ii_root_idx), 12 - abs(root_idx - ii_root_idx))
-                                dist_to_iii = min(abs(root_idx - iii_root_idx), 12 - abs(root_idx - iii_root_idx))
-                                dist_to_iv = min(abs(root_idx - (tonic_idx + 5) % 12), 12 - abs(root_idx - (tonic_idx + 5) % 12))
-                                dist_to_v = min(abs(root_idx - (tonic_idx + 7) % 12), 12 - abs(root_idx - (tonic_idx + 7) % 12))
-                                dist_to_vi = min(abs(root_idx - vi_root_idx), 12 - abs(root_idx - vi_root_idx))
-                                
-                                # Smart mapping: respect chord quality and prefer primary chords
-                                if 'm' in chord:
-                                    # For minor chords, prefer vi, then ii, then iii
-                                    minor_distances = [(dist_to_vi, vi_chord), (dist_to_ii, ii_chord), (dist_to_iii, iii_chord)]
-                                    closest_minor = min(minor_distances)[1]
-                                    biased_chords.append(closest_minor)
-                                else:
-                                    # For major chords, prefer I, IV, V
-                                    major_distances = [(dist_to_i, i_chord), (dist_to_iv, iv_chord), (dist_to_v, v_chord)]
-                                    closest_major = min(major_distances)[1]
-                                    biased_chords.append(closest_major)
+                    # Major key: prioritize I-IV-V-vi, be conservative with ii-iii-vii°
+                    primary_chords = [i_chord, iv_chord, v_chord, vi_chord]  # I-IV-V-vi
+                    secondary_chords = [ii_chord, iii_chord]  # ii-iii - sometimes present
+                    complex_chords = [vii_chord]  # vii° - rare in simple songs
+                
+                # Check primary chords first (exact match)
+                for primary_chord in primary_chords:
+                    if chord == primary_chord:
+                        biased_chords.append(primary_chord)
+                        matched = True
+                        break
+                
+                # Check secondary chords (exact match) - only if no primary match
+                if not matched:
+                    for secondary_chord in secondary_chords:
+                        if chord == secondary_chord:
+                            biased_chords.append(secondary_chord)
+                            matched = True
+                            break
+                
+                if not matched:
+                    # Check root matches with quality consideration (be more conservative)
+                    if is_minor:
+                        # Minor key matching priority: i-iv-V only for simple songs
+                        if root == key_center and 'm' in chord:
+                            biased_chords.append(i_chord)  # i minor
+                        elif root == note_names[(tonic_idx + 5) % 12] and 'm' in chord:
+                            biased_chords.append(iv_chord)  # iv minor
+                        elif root == note_names[(tonic_idx + 7) % 12]:
+                            # V root can be either B major (dominant) or F#m-like confusion
+                            # In minor keys, prefer ii (F#m) over V (B) unless strong resolution context
+                            if 'm' not in chord:
+                                # Check if we should map this B to F#m instead
+                                # For now, cautiously allow V but note it should be rare
+                                biased_chords.append(v_chord)  # V major (should be rare - only for resolutions)
                             else:
-                                biased_chords.append(i_chord)  # Default to tonic
+                                # If somehow detected as minor, it might be confused ii chord
+                                biased_chords.append(ii_chord)  # Map to ii minor
+                        elif root == note_names[(tonic_idx + 8) % 12] and 'm' not in chord:
+                            biased_chords.append(vi_chord)  # VI major
+                        elif root == note_names[(tonic_idx + 3) % 12] and 'm' not in chord:
+                            # Only allow III in specific contexts (likely chorus)
+                            biased_chords.append(iii_chord)  # III major (relative)
+                        elif root == note_names[(tonic_idx + 2) % 12] and 'm' in chord:
+                            # ii chord - minor chord in practical minor harmony
+                            biased_chords.append(ii_chord)  # ii minor
+                        else:
+                            # Conservative fallback: map ambiguous chords to tonic
+                            biased_chords.append(i_chord)
                     else:
-                        # For non-A# keys, use general harmonic distance mapping (full diatonic)
-                        if root in note_names:
-                            root_idx = note_names.index(root)
-                            ii_root_idx = (tonic_idx + 2) % 12
-                            iii_root_idx = (tonic_idx + 4) % 12
-                            vi_root_idx = (tonic_idx + 9) % 12
-                            
-                            # Distance to all diatonic chords
-                            dist_to_i = min(abs(root_idx - tonic_idx), 12 - abs(root_idx - tonic_idx))
-                            dist_to_ii = min(abs(root_idx - ii_root_idx), 12 - abs(root_idx - ii_root_idx))
-                            dist_to_iii = min(abs(root_idx - iii_root_idx), 12 - abs(root_idx - iii_root_idx))
-                            dist_to_iv = min(abs(root_idx - (tonic_idx + 5) % 12), 12 - abs(root_idx - (tonic_idx + 5) % 12))
-                            dist_to_v = min(abs(root_idx - (tonic_idx + 7) % 12), 12 - abs(root_idx - (tonic_idx + 7) % 12))
-                            dist_to_vi = min(abs(root_idx - vi_root_idx), 12 - abs(root_idx - vi_root_idx))
-                            
-                            # Smart mapping: respect chord quality and prefer primary chords
-                            if 'm' in chord:
-                                # For minor chords, prefer vi, then ii, then iii
-                                minor_distances = [(dist_to_vi, vi_chord), (dist_to_ii, ii_chord), (dist_to_iii, iii_chord)]
-                                closest_minor = min(minor_distances)[1]
-                                biased_chords.append(closest_minor)
-                            else:
-                                # For major chords, prefer I, IV, V
-                                major_distances = [(dist_to_i, i_chord), (dist_to_iv, iv_chord), (dist_to_v, v_chord)]
-                                closest_major = min(major_distances)[1]
-                                biased_chords.append(closest_major)
+                        # Major key matching priority: I-IV-V-vi only for simple songs
+                        if root == key_center and 'm' not in chord:
+                            biased_chords.append(i_chord)  # I major
+                        elif root == note_names[(tonic_idx + 5) % 12] and 'm' not in chord:
+                            biased_chords.append(iv_chord)  # IV major
+                        elif root == note_names[(tonic_idx + 7) % 12] and 'm' not in chord:
+                            biased_chords.append(v_chord)  # V major
+                        elif root == note_names[(tonic_idx + 9) % 12] and 'm' in chord:
+                            biased_chords.append(vi_chord)  # vi minor
                         else:
-                            biased_chords.append(i_chord)  # Default to tonic
+                            # Conservative fallback: map ambiguous chords to tonic
+                            biased_chords.append(i_chord)
+
             
             print(f"[DEBUG] AISU biased chords: {biased_chords}")
-            return biased_chords
+            
+            # Post-process: Convert inappropriate V chords to ii chords in minor keys
+            if is_minor:
+                biased_chords = _convert_excess_dominants_to_ii_aisu(biased_chords, key_center, is_minor)
+                print(f"[DEBUG] AISU after V->ii conversion: {biased_chords}")
+            
+            # Final post-process: Simplify all chords to basic triads
+            simplified_chords = _simplify_to_triads_aisu(biased_chords)
+            print(f"[DEBUG] AISU final simplified triads: {simplified_chords}")
+            
+            return simplified_chords
         else:
             return chords
             
@@ -416,9 +624,13 @@ def predict_chords_aisu(audio_path: str) -> List[str]:
             
             i += count
         
-        # 3. Apply I-IV-V bias for simple songs
-        print(f"[DEBUG] AISU raw chords before bias: {final_chords[:20]}")  # Show first 20 raw chords
-        i_iv_v_chords = _apply_i_iv_v_bias_aisu(final_chords)
+        # 3. Apply lighter temporal smoothing to reduce spurious detections
+        smoothed_chords = _apply_temporal_smoothing_aisu(final_chords, min_duration=1)
+        
+        # 4. Apply I-IV-V bias for simple songs
+        print(f"[DEBUG] AISU raw chords before bias: {smoothed_chords[:20]}")  # Show first 20 raw chords
+        print(f"[DEBUG] AISU unique raw chords: {list(set(smoothed_chords))}")  # Show all unique chords detected
+        i_iv_v_chords = _apply_i_iv_v_bias_aisu(smoothed_chords)
         
         # Ensure we have a reasonable progression
         if len(i_iv_v_chords) == 0:
