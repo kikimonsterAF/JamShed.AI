@@ -838,6 +838,39 @@ def _auto_select_beats_per_bar(
     else:
         flux_scores = {n: 0.0 for n in candidates}
 
+    # Low-frequency downbeat contrast (bass emphasis at bar starts)
+    lf_scores: dict = {}
+    if mel is not None and mel.size > 0 and beat_frames.size > 0:
+        # Take lowest mel bands (e.g., first 8)
+        lf = mel[: min(8, mel.shape[0]), :]
+        # Energy per frame
+        lf_energy = lf.sum(axis=0)
+        # Sample per beat
+        last_idx_lf = lf_energy.shape[0] - 1
+        beat_lf: List[float] = []
+        for f in beat_frames:
+            idx = int(f)
+            if idx < 0:
+                idx = 0
+            if idx > last_idx_lf:
+                idx = last_idx_lf
+            beat_lf.append(float(lf_energy[idx]))
+        beat_lf = np.asarray(beat_lf, dtype=float)
+        for n in candidates:
+            if n <= 0 or beat_lf.size == 0:
+                lf_scores[n] = 0.0
+                continue
+            pos = np.arange(len(beat_lf)) % n
+            pos0 = beat_lf[pos == 0]
+            posO = beat_lf[pos != 0]
+            if pos0.size == 0 or posO.size == 0:
+                lf_scores[n] = 0.0
+            else:
+                contrast = (pos0.mean() - posO.mean()) / (1e-6 + beat_lf.mean())
+                lf_scores[n] = float(max(contrast, 0.0))
+    else:
+        lf_scores = {n: 0.0 for n in candidates}
+
     # Periodicity via autocorrelation at lag=n (compare 3-beat vs 2-beat strength)
     def _sample_onsets_per_beat(beat_frames_arr: np.ndarray, onset_env_arr: np.ndarray) -> np.ndarray:
         if onset_env_arr.ndim == 0 or beat_frames_arr.size == 0:
@@ -934,14 +967,16 @@ def _auto_select_beats_per_bar(
     flux_n = normalize(flux_scores)
     periodicity_n = normalize(periodicity_scores)
     runmult_n = normalize(runmult_scores)
-    # Blend: accent (0.28) + homogeneity (0.25) + flux (0.18) + periodicity (0.14) + run-multiples (0.10) + phrase (0.05)
+    lf_n = normalize(lf_scores)
+    # Blend: accent (0.24) + homogeneity (0.22) + flux (0.16) + periodicity (0.12) + run-multiples (0.10) + low-bass (0.11) + phrase (0.05)
     total_scores = {
         n: 0.05 * phrase_n.get(n, 0.0)
-        + 0.28 * accent_n.get(n, 0.0)
-        + 0.25 * homo_n.get(n, 0.0)
-        + 0.18 * flux_n.get(n, 0.0)
-        + 0.14 * periodicity_n.get(n, 0.0)
+        + 0.24 * accent_n.get(n, 0.0)
+        + 0.22 * homo_n.get(n, 0.0)
+        + 0.16 * flux_n.get(n, 0.0)
+        + 0.12 * periodicity_n.get(n, 0.0)
         + 0.10 * runmult_n.get(n, 0.0)
+        + 0.11 * lf_n.get(n, 0.0)
         for n in candidates
     }
 
@@ -952,7 +987,7 @@ def _auto_select_beats_per_bar(
             total_scores[3] *= 0.6  # penalize if not enough 3-beat alignment
         print(f"[DEBUG] 🥁 3/4 alignment ratio={align3:.2f} (>=0.60 required to avoid penalty)")
 
-    print(f"[DEBUG] 🥁 Meter scoring - phrase={phrase_scores}, accent={accent_scores}, homo={homo_scores}, flux={flux_scores}, periodicity={periodicity_scores}, runmult={runmult_scores}, total(pre)={total_scores}")
+    print(f"[DEBUG] 🥁 Meter scoring - phrase={phrase_scores}, accent={accent_scores}, homo={homo_scores}, flux={flux_scores}, periodicity={periodicity_scores}, runmult={runmult_scores}, lf={lf_scores}, total(pre)={total_scores}")
 
     # Require margin for 3/4 over others to reduce false positives
     if 3 in total_scores:
