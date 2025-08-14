@@ -182,7 +182,7 @@ class AISUChordDetector:
 
 
 def _detect_key_with_minor_support_aisu(chords: List[str]) -> Tuple[str, bool]:
-    """Detect key center and major/minor mode from chord progression with proper minor key support"""
+    """Detect key center and major/minor mode from chord progression with enhanced modal support"""
     if not chords:
         return 'C', False
         
@@ -206,8 +206,44 @@ def _detect_key_with_minor_support_aisu(chords: List[str]) -> Tuple[str, bool]:
                 # Major chord (or dominant)
                 major_chord_counts[root] = major_chord_counts.get(root, 0) + 1
     
-    # Find most common root overall
+    # Find most common root overall for primary tonic candidate
     most_common_root = max(total_chord_counts.items(), key=lambda x: x[1])[0] if total_chord_counts else 'C'
+    
+    # Enhanced modal/chromatic progression analysis
+    print(f"[DEBUG] Chord counts: total={total_chord_counts}, major={major_chord_counts}, minor={minor_chord_counts}")
+    
+    # Look for modal patterns - check for chromatic relationships that suggest specific keys
+    unique_chord_roots = list(total_chord_counts.keys())
+    
+    # For chromatic progressions like Eb-C#-G#, try to find the best tonal center
+    modal_candidates = {}
+    
+    for potential_tonic in note_names:
+        tonic_idx = note_names.index(potential_tonic)
+        modal_score = 0
+        
+        # Score based on diatonic relationships and emphasis
+        for chord_root in unique_chord_roots:
+            root_idx = note_names.index(chord_root)
+            interval = (root_idx - tonic_idx) % 12
+            weight = total_chord_counts[chord_root]
+            
+            # Major scale intervals (strong indicators)
+            if interval in [0, 2, 4, 5, 7, 9, 11]:  # I, ii, iii, IV, V, vi, vii
+                modal_score += weight * 2
+            # Chromatic/modal intervals (moderate indicators)
+            elif interval in [1, 3, 6, 8, 10]:  # bii, biii, bvi, bvii, etc.
+                modal_score += weight * 1
+            
+            # Special bonus for tonic emphasis
+            if chord_root == potential_tonic:
+                modal_score += weight * 3
+        
+        modal_candidates[potential_tonic] = modal_score
+    
+    # Find best modal candidate
+    best_tonic = max(modal_candidates.items(), key=lambda x: x[1])[0]
+    print(f"[DEBUG] Modal analysis: best_tonic={best_tonic}, candidates={modal_candidates}")
     
     # Analyze harmonic patterns to determine major vs minor
     major_evidence = 0
@@ -223,12 +259,12 @@ def _detect_key_with_minor_support_aisu(chords: List[str]) -> Tuple[str, bool]:
             iv_root = note_names[(root_idx + 5) % 12]  # iv chord
             v_root = note_names[(root_idx + 7) % 12]   # V chord
             
-            if (root == most_common_root and 
+            if (root == best_tonic and 
                 ii_root in minor_chord_counts and 
                 iv_root in minor_chord_counts):
                 minor_evidence += 4  # Strong evidence for minor key i-ii-iv
                 print(f"[DEBUG] Found i-ii-iv pattern: {root}m-{ii_root}m-{iv_root}m")
-            elif (root == most_common_root and 
+            elif (root == best_tonic and 
                 (iv_root in minor_chord_counts or iv_root in major_chord_counts) and 
                 v_root in major_chord_counts):
                 minor_evidence += 2  # Evidence for minor key i-iv-V (but V should be rare)
@@ -238,7 +274,7 @@ def _detect_key_with_minor_support_aisu(chords: List[str]) -> Tuple[str, bool]:
             vi_root = note_names[(root_idx + 9) % 12]  # VI chord
             vii_root = note_names[(root_idx + 10) % 12] # VII chord
             
-            if (root == most_common_root and 
+            if (root == best_tonic and 
                 vi_root in major_chord_counts and 
                 vii_root in major_chord_counts):
                 minor_evidence += 2  # Evidence for minor key i-VI-VII
@@ -253,7 +289,7 @@ def _detect_key_with_minor_support_aisu(chords: List[str]) -> Tuple[str, bool]:
             iv_root = note_names[(root_idx + 5) % 12]  # IV chord
             v_root = note_names[(root_idx + 7) % 12]   # V chord
             
-            if (root == most_common_root and 
+            if (root == best_tonic and 
                 iv_root in major_chord_counts and 
                 v_root in major_chord_counts):
                 major_evidence += 3  # Strong evidence for major key I-IV-V
@@ -272,8 +308,8 @@ def _detect_key_with_minor_support_aisu(chords: List[str]) -> Tuple[str, bool]:
     is_minor = minor_evidence > major_evidence
     
     # Additional heuristic: if tonic appears more often as minor than major, likely minor key
-    tonic_minor_count = minor_chord_counts.get(most_common_root, 0)
-    tonic_major_count = major_chord_counts.get(most_common_root, 0)
+    tonic_minor_count = minor_chord_counts.get(best_tonic, 0)
+    tonic_major_count = major_chord_counts.get(best_tonic, 0)
     
     if tonic_minor_count > tonic_major_count:
         is_minor = True
@@ -281,10 +317,10 @@ def _detect_key_with_minor_support_aisu(chords: List[str]) -> Tuple[str, bool]:
     elif tonic_major_count > tonic_minor_count:
         major_evidence += 1
     
-    print(f"[DEBUG] Key analysis: {most_common_root} - Major evidence: {major_evidence}, Minor evidence: {minor_evidence}")
-    print(f"[DEBUG] Tonic chord counts: {most_common_root} major={tonic_major_count}, {most_common_root}m minor={tonic_minor_count}")
+    print(f"[DEBUG] Key analysis: {best_tonic} - Major evidence: {major_evidence}, Minor evidence: {minor_evidence}")
+    print(f"[DEBUG] Tonic chord counts: {best_tonic} major={tonic_major_count}, {best_tonic}m minor={tonic_minor_count}")
     
-    return most_common_root, is_minor
+    return best_tonic, is_minor
 
 
 def _apply_temporal_smoothing_aisu(chords: List[str], min_duration: int = 2) -> List[str]:
@@ -536,13 +572,13 @@ def predict_chords_aisu(audio_path: str) -> List[str]:
         # Load audio with librosa
         y, sr = librosa.load(audio_path, sr=22050, mono=True)
         
-        # Advanced chroma analysis inspired by AISU approach
+        # Enhanced chroma analysis for modal/chromatic music  
         # Use CQT for better harmonic resolution (similar to AISU preprocessing)
         chroma_cqt = librosa.feature.chroma_cqt(
             y=y, sr=sr, 
             hop_length=512,
             fmin=librosa.note_to_hz('C2'),
-            bins_per_octave=24,  # Higher resolution
+            bins_per_octave=24,  # Higher resolution for modal detection
             n_octaves=6
         )
         
@@ -554,41 +590,133 @@ def predict_chords_aisu(audio_path: str) -> List[str]:
         chroma_sync = librosa.util.sync(chroma_cqt, beats)
         print(f"[DEBUG] AISU chroma_sync shape: {chroma_sync.shape} - processing {chroma_sync.shape[1]} beat segments")
         
-        # Enhanced chord recognition with AISU-inspired templates
+        # Enhanced chord recognition with modal-aware templates
         chord_names = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
         
-        # Major and minor chord templates (enhanced)
-        major_template = np.array([1, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0])
-        minor_template = np.array([1, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0])
-        seventh_template = np.array([1, 0, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0])
+        # Improved chord templates with better resolution
+        major_template = np.array([1.0, 0, 0, 0, 0.8, 0, 0, 0.6, 0, 0, 0, 0])  # Root, Major 3rd, Perfect 5th
+        minor_template = np.array([1.0, 0, 0, 0.8, 0, 0, 0, 0.6, 0, 0, 0, 0])  # Root, Minor 3rd, Perfect 5th
+        seventh_template = np.array([1.0, 0, 0, 0, 0.8, 0, 0, 0.6, 0, 0, 0.4, 0])  # Root, Major 3rd, Perfect 5th, Minor 7th
         
         detected_chords = []
-        for beat_chroma in chroma_sync.T:
-            best_score = 0
-            best_chord = "C"
+        for beat_idx, beat_chroma in enumerate(chroma_sync.T):
+            # Normalize chroma vector for better comparison
+            beat_chroma = beat_chroma / (np.linalg.norm(beat_chroma) + 1e-8)
             
-            # Test all root positions and chord types
+            best_score = -1
+            best_chord = "C"
+            best_type = "major"
+            
+            # Test all root positions and chord types with improved scoring
             for root in range(12):
-                # Test major
+                # Test major - use cosine similarity for better modal detection
                 template = np.roll(major_template, root)
-                score = np.dot(beat_chroma, template)
+                template_norm = template / (np.linalg.norm(template) + 1e-8)
+                score = np.dot(beat_chroma, template_norm)
+                
                 if score > best_score:
                     best_score = score
                     best_chord = chord_names[root]
+                    best_type = "major"
                 
-                # Test minor  
+                # Test minor with enhanced detection
                 template = np.roll(minor_template, root)
-                score = np.dot(beat_chroma, template)
+                template_norm = template / (np.linalg.norm(template) + 1e-8)
+                score = np.dot(beat_chroma, template_norm)
+                
                 if score > best_score:
                     best_score = score
                     best_chord = chord_names[root] + "m"
+                    best_type = "minor"
                 
-                # Test seventh (for more advanced detection)
+                # Test seventh with moderate penalty for modal contexts
                 template = np.roll(seventh_template, root)
-                score = np.dot(beat_chroma, template) * 0.8  # Slightly penalize 7ths
+                template_norm = template / (np.linalg.norm(template) + 1e-8)
+                score = np.dot(beat_chroma, template_norm) * 0.9  # Light penalty for 7ths
+                
                 if score > best_score:
                     best_score = score
                     best_chord = chord_names[root] + "7"
+                    best_type = "seventh"
+            
+            # Enhanced modal chord correction for chromatic progressions
+            # Post-process chord detection to fix common modal issues
+            
+            # Handle enharmonic and modal detection issues
+            if best_chord == 'Cm':
+                # Check multiple alternative interpretations
+                alternatives = []
+                
+                # Alternative 1: C# major
+                c_sharp_template = np.roll(major_template, 1)  # C# major
+                c_sharp_template_norm = c_sharp_template / (np.linalg.norm(c_sharp_template) + 1e-8)
+                c_sharp_score = np.dot(beat_chroma, c_sharp_template_norm)
+                alternatives.append(('C#', c_sharp_score))
+                
+                # Alternative 2: Db major (enharmonic equivalent)
+                db_template = np.roll(major_template, 1)  # Db major (same as C#)
+                db_score = c_sharp_score  # Same as C# 
+                alternatives.append(('Db', db_score))
+                
+                # Current Cm score for comparison
+                cm_template = np.roll(minor_template, 0)  # C minor
+                cm_template_norm = cm_template / (np.linalg.norm(cm_template) + 1e-8)
+                cm_score = np.dot(beat_chroma, cm_template_norm)
+                alternatives.append(('Cm', cm_score))
+                
+                # Choose the best alternative
+                best_alt = max(alternatives, key=lambda x: x[1])
+                
+                if best_alt[1] > cm_score * 1.05:  # Small threshold for switching
+                    original_chord = best_chord
+                    best_chord = best_alt[0]
+                    print(f"[DEBUG] Beat {beat_idx}: Corrected {original_chord} -> {best_chord} (score: {best_alt[1]:.3f} vs {cm_score:.3f})")
+            
+            # Similar correction for other potentially problematic chords in modal contexts
+            elif best_chord in ['Dm', 'Em', 'Fm', 'Gm', 'Am', 'Bm']:
+                # Check if the sharp major equivalent is stronger
+                root_minor = best_chord[0]
+                if root_minor in chord_names:
+                    root_idx = chord_names.index(root_minor)
+                    sharp_idx = (root_idx + 1) % 12  # Next semitone up
+                    
+                    # Test sharp major alternative
+                    sharp_template = np.roll(major_template, sharp_idx)
+                    sharp_template_norm = sharp_template / (np.linalg.norm(sharp_template) + 1e-8)
+                    sharp_score = np.dot(beat_chroma, sharp_template_norm)
+                    
+                    if sharp_score > best_score * 1.1:  # 10% better threshold
+                        original_chord = best_chord
+                        best_chord = chord_names[sharp_idx]
+                        print(f"[DEBUG] Beat {beat_idx}: Modal correction {original_chord} -> {best_chord} (sharp alternative stronger)")
+            
+            # Debug output for chord detection issues
+            if beat_idx < 10 or best_chord in ['Cm', 'C#', 'C']:  # Debug problematic chords
+                peak_indices = np.argsort(beat_chroma)[-3:]
+                print(f"[DEBUG] Beat {beat_idx}: score={best_score:.3f}, chord={best_chord}, type={best_type}")
+                print(f"[DEBUG] Beat {beat_idx}: Top chroma peaks: {[chord_names[i] + f'({beat_chroma[i]:.3f})' for i in peak_indices]}")
+            
+            # Additional confidence check for modal accuracy
+            if best_score < 0.3:  # Low confidence threshold
+                # Look for dominant chroma peaks to improve accuracy
+                peak_indices = np.argsort(beat_chroma)[-3:]  # Top 3 chroma values
+                peak_chord_candidate = chord_names[peak_indices[-1]]  # Strongest peak
+                
+                # Verify chord quality based on interval relationships
+                root_idx = peak_indices[-1] % 12
+                third_major_idx = (root_idx + 4) % 12
+                third_minor_idx = (root_idx + 3) % 12
+                fifth_idx = (root_idx + 7) % 12
+                
+                major_strength = beat_chroma[third_major_idx] + beat_chroma[fifth_idx]
+                minor_strength = beat_chroma[third_minor_idx] + beat_chroma[fifth_idx]
+                
+                if major_strength > minor_strength * 1.1:  # Bias towards major for modal
+                    best_chord = peak_chord_candidate
+                elif minor_strength > major_strength:
+                    best_chord = peak_chord_candidate + "m"
+                
+                print(f"[DEBUG] Beat {beat_idx}: Low confidence {best_score:.3f}, peak analysis -> {best_chord}")
             
             detected_chords.append(best_chord)
         
