@@ -837,6 +837,67 @@ def _auto_select_beats_per_bar(
             flux_scores[n] = float(np.dot(pos_means, tmpl) / denom)
     else:
         flux_scores = {n: 0.0 for n in candidates}
+
+    # Periodicity via autocorrelation at lag=n (compare 3-beat vs 2-beat strength)
+    def _sample_onsets_per_beat(beat_frames_arr: np.ndarray, onset_env_arr: np.ndarray) -> np.ndarray:
+        if onset_env_arr.ndim == 0 or beat_frames_arr.size == 0:
+            return np.zeros(0, dtype=float)
+        vals: List[float] = []
+        last = onset_env_arr.shape[0] - 1
+        for f in beat_frames_arr:
+            idx = int(f)
+            if idx < 0:
+                idx = 0
+            if idx > last:
+                idx = last
+            vals.append(float(onset_env_arr[idx]))
+        return np.asarray(vals, dtype=float)
+
+    def _norm_autocorr_at_lag(seq: np.ndarray, lag: int) -> float:
+        L = int(seq.shape[0])
+        if L < lag + 2 or lag <= 0:
+            return 0.0
+        s = (seq - (seq.mean() if L > 0 else 0.0))
+        num = float(np.dot(s[:-lag], s[lag:]))
+        den = float(np.dot(s, s)) + 1e-9
+        val = num / den
+        return max(val, 0.0)
+
+    # Build sequences: onsets, flux, and chord-change impulse train
+    beat_onsets_seq = _sample_onsets_per_beat(beat_frames, onset_env)
+    beat_flux_seq = None
+    if mel is not None and mel.size > 0 and beat_frames.size > 1:
+        mel_db = librosa.power_to_db(mel, ref=np.max)
+        diff = np.diff(mel_db, axis=1)
+        flux_full = np.maximum(diff, 0.0).sum(axis=0)
+        # Sample at beat frames
+        last_idx_ff = flux_full.shape[0] - 1
+        bf: List[float] = []
+        for f in beat_frames:
+            idx = int(f)
+            if idx < 1:
+                idx = 1
+            if idx > last_idx_ff:
+                idx = last_idx_ff
+            bf.append(float(flux_full[idx]))
+        beat_flux_seq = np.asarray(bf, dtype=float)
+    # Changes impulse
+    Lbeats = len(beat_chords)
+    changes_imp = np.zeros(Lbeats, dtype=float)
+    change_idxs = [i for i in range(1, Lbeats) if beat_chords[i] != beat_chords[i - 1]]
+    for i in change_idxs:
+        changes_imp[i] = 1.0
+
+    periodicity_scores: dict = {}
+    for n in candidates:
+        if n <= 0:
+            periodicity_scores[n] = 0.0
+            continue
+        p_on = _norm_autocorr_at_lag(beat_onsets_seq, n) if beat_onsets_seq.size else 0.0
+        p_fx = _norm_autocorr_at_lag(beat_flux_seq, n) if isinstance(beat_flux_seq, np.ndarray) and beat_flux_seq.size else 0.0
+        p_ch = _norm_autocorr_at_lag(changes_imp, n) if changes_imp.size else 0.0
+        # Weighted average
+        periodicity_scores[n] = 0.4 * p_on + 0.3 * p_fx + 0.3 * p_ch
     def normalize(d: dict) -> dict:
         vals = list(d.values())
         if not vals:
@@ -849,12 +910,14 @@ def _auto_select_beats_per_bar(
     accent_n = normalize(accent_scores)
     homo_n = normalize(homo_scores)
     flux_n = normalize(flux_scores)
-    # Blend: accent (0.35) + homogeneity (0.35) + flux (0.2) + phrase (0.1)
+    periodicity_n = normalize(periodicity_scores)
+    # Blend: accent (0.3) + homogeneity (0.3) + flux (0.2) + periodicity (0.15) + phrase (0.05)
     total_scores = {
-        n: 0.1 * phrase_n.get(n, 0.0)
-        + 0.35 * accent_n.get(n, 0.0)
-        + 0.35 * homo_n.get(n, 0.0)
-        + 0.2 * flux_n.get(n, 0.0)
+        n: 0.05 * phrase_n.get(n, 0.0)
+        + 0.30 * accent_n.get(n, 0.0)
+        + 0.30 * homo_n.get(n, 0.0)
+        + 0.20 * flux_n.get(n, 0.0)
+        + 0.15 * periodicity_n.get(n, 0.0)
         for n in candidates
     }
 
@@ -865,14 +928,19 @@ def _auto_select_beats_per_bar(
             total_scores[3] *= 0.6  # penalize if not enough 3-beat alignment
         print(f"[DEBUG] 🥁 3/4 alignment ratio={align3:.2f} (>=0.60 required to avoid penalty)")
 
-    print(f"[DEBUG] 🥁 Meter scoring - phrase={phrase_scores}, accent={accent_scores}, homo={homo_scores}, flux={flux_scores}, total(pre)={total_scores}")
+    print(f"[DEBUG] 🥁 Meter scoring - phrase={phrase_scores}, accent={accent_scores}, homo={homo_scores}, flux={flux_scores}, periodicity={periodicity_scores}, total(pre)={total_scores}")
 
     # Require margin for 3/4 over others to reduce false positives
     if 3 in total_scores:
         best_other = max([v for k, v in total_scores.items() if k != 3] or [0.0])
-        # Require a small but real margin for 3/4
-        if total_scores[3] < best_other + 0.05:
-            total_scores[3] *= 0.95
+        # Additional periodicity gate: 3-beat periodicity should exceed 2-beat by a margin
+        p3 = periodicity_scores.get(3, 0.0)
+        p2 = periodicity_scores.get(2, 0.0)
+        if p3 < p2 + 0.03:
+            total_scores[3] *= 0.9
+        # Require a small but real margin overall
+        if total_scores[3] < best_other + 0.03:
+            total_scores[3] *= 0.97
 
     best_n = max(total_scores.items(), key=lambda kv: (kv[1], kv[0] == 4, kv[0] == 2))[0]
     print(f"[DEBUG] 🥁 Auto meter selection -> {best_n}/4 (scores={total_scores})")
