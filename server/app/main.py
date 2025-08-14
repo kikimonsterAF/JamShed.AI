@@ -1002,6 +1002,22 @@ def _auto_select_beats_per_bar(
             total_scores[3] *= 0.97
 
     best_n = max(total_scores.items(), key=lambda kv: (kv[1], kv[0] == 4, kv[0] == 2))[0]
+
+    # Final waltz check: if 3 beats shows clearly stronger structural evidence than 2, choose 3/4
+    if 3 in candidates and 2 in candidates:
+        align2 = _change_alignment_ratio(beat_chords, 2)
+        align3 = _change_alignment_ratio(beat_chords, 3)
+        per2 = periodicity_scores.get(2, 0.0)
+        per3 = periodicity_scores.get(3, 0.0)
+        homo2 = homo_scores.get(2, 0.0)
+        homo3 = homo_scores.get(3, 0.0)
+        flux2 = flux_scores.get(2, 0.0)
+        flux3 = flux_scores.get(3, 0.0)
+        # Require multiple cues to favor 3: stronger bar-start alignment and periodicity and not worse homogeneity
+        if (align3 - align2) > 0.15 and (per3 - per2) > 0.05 and (homo3 + 1e-6) >= (homo2 - 1e-6) and (flux3 + 1e-6) >= (flux2 - 1e-6):
+            print(f"[DEBUG] 🥁 Waltz override triggered: align3={align3:.2f} per3={per3:.2f} homo3={homo3:.2f} vs 2-beat align2={align2:.2f} per2={per2:.2f} homo2={homo2:.2f}")
+            best_n = 3
+
     print(f"[DEBUG] 🥁 Auto meter selection -> {best_n}/4 (scores={total_scores})")
     return int(best_n)
 
