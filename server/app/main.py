@@ -770,6 +770,9 @@ def _score_meter_accent(
         template = np.array([1.0, 0.3, 0.3], dtype=float)
     elif n == 4:
         template = np.array([1.0, 0.3, 0.6, 0.3], dtype=float)  # strong-weak-medium-weak
+    elif n == 6:
+        # Compound 6/8 feel: strong on 1, secondary on 4
+        template = np.array([1.0, 0.2, 0.2, 0.8, 0.2, 0.2], dtype=float)
     else:
         # For other meters, fallback to downbeat emphasis only
         template = np.zeros(n, dtype=float)
@@ -805,7 +808,7 @@ def _auto_select_beats_per_bar(
     beat_chords: List[str],
     beat_frames: np.ndarray,
     onset_env: np.ndarray,
-    candidates: Tuple[int, ...] = (2, 3, 4),
+    candidates: Tuple[int, ...] = (2, 3, 4, 6),
     mel: Optional[np.ndarray] = None,
     f0_seq: Optional[np.ndarray] = None,
     debug_dict: Optional[dict] = None,
@@ -873,6 +876,8 @@ def _auto_select_beats_per_bar(
                 tmpl = np.array([1.0, 0.3, 0.3])
             elif n == 4:
                 tmpl = np.array([1.0, 0.3, 0.6, 0.3])
+            elif n == 6:
+                tmpl = np.array([1.0, 0.2, 0.2, 0.8, 0.2, 0.2])
             else:
                 tmpl = np.zeros(n); tmpl[0] = 1.0
             tmpl = tmpl / (tmpl.sum() + 1e-9)
@@ -1085,7 +1090,7 @@ def _auto_select_beats_per_bar(
         if total_scores[3] < best_other + 0.01:
             total_scores[3] *= 0.99
 
-    best_n = max(total_scores.items(), key=lambda kv: (kv[1], kv[0] == 4, kv[0] == 2))[0]
+    best_n = max(total_scores.items(), key=lambda kv: (kv[1], kv[0] == 4, kv[0] == 3, kv[0] == 2))[0]
 
     # Final waltz check: if 3 beats shows clearly stronger structural evidence than 2, choose 3/4
     if 3 in candidates and 2 in candidates:
@@ -1109,9 +1114,16 @@ def _auto_select_beats_per_bar(
                 "per3": per3,
             })
 
+    # Map 6 to 3 for UI display (compound waltz as 3/4 feel)
+    mapped_from_6 = False
+    if best_n == 6:
+        mapped_from_6 = True
+        best_n = 3
     print(f"[DEBUG] 🥁 Auto meter selection -> {best_n}/4 (scores={total_scores})")
     if debug_dict is not None:
         debug_dict["total_scores"] = total_scores
         debug_dict["selected"] = int(best_n)
+        if mapped_from_6:
+            debug_dict["mapped_from_6"] = True
     return int(best_n)
 
