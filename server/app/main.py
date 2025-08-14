@@ -239,7 +239,7 @@ def _analyze_path(
         raise HTTPException(status_code=400, detail=f"Failed to decode audio (path={src_path}, size={size}). Ensure FFmpeg/ffprobe are available and the media is valid.")
 
     # Chroma features and beat-synchronous pooling
-    chroma, beat_frames = _compute_beatsynced_chroma(y, sr)
+    chroma, beat_frames, tempo = _compute_beatsynced_chroma(y, sr)
 
     # Key estimation
     key_center, key_mode = _estimate_key_from_chroma(chroma)
@@ -319,7 +319,7 @@ def _analyze_path(
                 user_bpb = num
         except Exception:
             user_bpb = None
-    selected_bpb = user_bpb or _select_phrase_len(beat_chords)
+    selected_bpb = user_bpb or _select_phrase_len(beat_chords, tempo=tempo)
 
     # Form labels
     form_labels = _infer_form_from_chords(beat_chords, phrase_len=selected_bpb)
@@ -408,8 +408,8 @@ def _decode_audio_with_ffmpeg(src_path: str, target_sr: int = 22050) -> Tuple[np
             pass
 
 
-def _compute_beatsynced_chroma(y: np.ndarray, sr: int) -> Tuple[np.ndarray, np.ndarray]:
-    """Compute chroma-cqt and aggregate per beat for chord inference."""
+def _compute_beatsynced_chroma(y: np.ndarray, sr: int) -> Tuple[np.ndarray, np.ndarray, float]:
+    """Compute chroma-cqt and aggregate per beat for chord inference. Returns (chroma, beats, tempo)."""
     y = librosa.effects.harmonic(y)
     chroma = librosa.feature.chroma_cqt(y=y, sr=sr)
     tempo, beats = librosa.beat.beat_track(y=y, sr=sr)
@@ -418,9 +418,9 @@ def _compute_beatsynced_chroma(y: np.ndarray, sr: int) -> Tuple[np.ndarray, np.n
         frames = chroma.shape[1]
         window = max(1, frames // 32)
         pools = [chroma[:, i : i + window].mean(axis=1) for i in range(0, frames, window)]
-        return np.stack(pools, axis=1), np.arange(len(pools))
+        return np.stack(pools, axis=1), np.arange(len(pools)), 120.0  # Default tempo fallback
     beat_chroma = librosa.util.sync(chroma, beats, aggregate=np.mean)
-    return beat_chroma, beats
+    return beat_chroma, beats, float(tempo)
 
 
 def _estimate_key_from_chroma(chroma: np.ndarray) -> Tuple[str, str]:
@@ -490,9 +490,10 @@ def _infer_form_from_chords(beat_chords: List[str], phrase_len: int = 4) -> List
     return labels
 
 
-def _select_phrase_len(beat_chords: List[str], candidates: Tuple[int, ...] = (2, 3, 4, 5, 6)) -> int:
+def _select_phrase_len(beat_chords: List[str], candidates: Tuple[int, ...] = (2, 3, 4, 5, 6), tempo: Optional[float] = None) -> int:
     """Auto-select beats-per-bar by choosing phrase length with most repetition and lowest remainder.
-
+    
+    Enhanced with waltz detection: bias toward 3/4 time for waltz-like characteristics.
     Scoring: score = unique_phrases_ratio + remainder_penalty, lower is better.
     """
     if not beat_chords:
@@ -500,6 +501,10 @@ def _select_phrase_len(beat_chords: List[str], candidates: Tuple[int, ...] = (2,
     best_len = 4
     best_score = float("inf")
     total = len(beat_chords)
+    
+    # Detect waltz characteristics
+    waltz_bias = _detect_waltz_characteristics(beat_chords, tempo)
+    
     for n in candidates:
         if n <= 0:
             continue
@@ -511,9 +516,73 @@ def _select_phrase_len(beat_chords: List[str], candidates: Tuple[int, ...] = (2,
         remainder = total % n
         remainder_penalty = remainder / n
         score = unique_ratio + remainder_penalty
+        
+        # Apply waltz bias - strongly favor 3/4 time for waltz-like songs
+        if waltz_bias and n == 3:
+            score *= 0.7  # 30% bonus for 3/4 time when waltz detected
+            print(f"[DEBUG] 🎼 Waltz detected! Applying 3/4 bias, score: {score:.3f}")
+        
         if score < best_score:
             best_score = score
             best_len = n
+    
+    print(f"[DEBUG] 🥁 Beat detection - Selected: {best_len}/4, Waltz bias: {waltz_bias}")
     return best_len
+
+
+def _detect_waltz_characteristics(beat_chords: List[str], tempo: Optional[float] = None) -> bool:
+    """Detect if this song has waltz-like characteristics (3/4 time)."""
+    if not beat_chords or len(beat_chords) < 12:
+        return False
+    
+    # Waltz tempo range (typically 60-180 BPM for dotted quarter note)
+    tempo_suggests_waltz = False
+    if tempo is not None:
+        # For 3/4 waltzes, tempo is often 60-180 BPM (moderate waltz range)
+        tempo_suggests_waltz = 60 <= tempo <= 180
+    
+    # Check for 3-beat patterns in chord progression
+    # Waltzes often have ONE chord per measure (3 beats), creating strong 3-beat groupings
+    three_beat_segments = [tuple(beat_chords[i:i+3]) for i in range(0, len(beat_chords) - 2, 3)]
+    if len(three_beat_segments) < 4:
+        return False
+    
+    # Look for patterns where chord changes happen every 3 beats
+    # Count segments where first beat has different chord from previous segment's first beat
+    chord_changes_every_3 = 0
+    total_segments = len(three_beat_segments)
+    
+    for i in range(1, total_segments):
+        prev_segment = three_beat_segments[i-1]
+        curr_segment = three_beat_segments[i]
+        # Check if chord changes at the beginning of 3-beat phrase
+        if prev_segment[0] != curr_segment[0]:
+            chord_changes_every_3 += 1
+    
+    # If >50% of segments start with chord changes, suggests 3/4 time
+    chord_change_ratio = chord_changes_every_3 / max(1, total_segments - 1)
+    strong_3_beat_pattern = chord_change_ratio > 0.4
+    
+    # Additional check: repetitive 3-beat patterns with minimal variation
+    unique_3_segments = len(set(three_beat_segments))
+    repetition_3_ratio = unique_3_segments / max(1, len(three_beat_segments))
+    
+    # Compare with 2-beat and 4-beat patterns
+    two_beat_segments = [tuple(beat_chords[i:i+2]) for i in range(0, len(beat_chords) - 1, 2)]
+    unique_2_segments = len(set(two_beat_segments))
+    repetition_2_ratio = unique_2_segments / max(1, len(two_beat_segments))
+    
+    # Waltz is more likely if 3-beat patterns are more repetitive than 2-beat
+    pattern_suggests_waltz = repetition_3_ratio < repetition_2_ratio
+    
+    waltz_detected = strong_3_beat_pattern or pattern_suggests_waltz
+    if tempo_suggests_waltz:
+        waltz_detected = True  # Tempo is strong indicator
+    
+    print(f"[DEBUG] 🎼 Waltz analysis: tempo={tempo}, 3-beat changes={chord_change_ratio:.2f}, "
+          f"3-beat repetition={repetition_3_ratio:.2f}, 2-beat repetition={repetition_2_ratio:.2f}, "
+          f"detected={waltz_detected}")
+    
+    return waltz_detected
 
 
