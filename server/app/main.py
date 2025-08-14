@@ -243,7 +243,7 @@ def _analyze_path(
         raise HTTPException(status_code=400, detail=f"Failed to decode audio (path={src_path}, size={size}). Ensure FFmpeg/ffprobe are available and the media is valid.")
 
     # Chroma features and beat-synchronous pooling
-    chroma, beat_frames, tempo, onset_env, mel, f0 = _compute_beatsynced_chroma(y, sr)
+    chroma, beat_frames, tempo, onset_env, mel, f0, bass_chroma = _compute_beatsynced_chroma(y, sr)
 
     # Key estimation
     key_center, key_mode = _estimate_key_from_chroma(chroma)
@@ -328,6 +328,7 @@ def _analyze_path(
         candidates=(2, 3, 4),
         mel=mel,
         f0_seq=f0,
+        beat_chroma=bass_chroma,
         debug_dict=debug_payload,
     )
 
@@ -421,18 +422,28 @@ def _decode_audio_with_ffmpeg(src_path: str, target_sr: int = 22050) -> Tuple[np
             pass
 
 
-def _compute_beatsynced_chroma(y: np.ndarray, sr: int) -> Tuple[np.ndarray, np.ndarray, float, np.ndarray, np.ndarray, np.ndarray]:
+def _compute_beatsynced_chroma(y: np.ndarray, sr: int) -> Tuple[np.ndarray, np.ndarray, float, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Compute chroma-cqt and aggregate per beat for chord inference.
     Returns (beat_synced_chroma, beat_frames, tempo, onset_envelope).
     """
     y = librosa.effects.harmonic(y)
     chroma = librosa.feature.chroma_cqt(y=y, sr=sr)
-    mel = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=64)
-    # Fundamental frequency (bass) track (mono). Restrict to bass register.
+    # Bass-focused chroma (limit low fmin)
     try:
-        f0 = librosa.yin(y, fmin=50, fmax=220, sr=sr)
+        bass_chroma = librosa.feature.chroma_cqt(y=y, sr=sr, fmin=librosa.note_to_hz('A1'))
     except Exception:
-        f0 = np.zeros(1, dtype=float)
+        bass_chroma = chroma
+    mel = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=64)
+    # Fundamental frequency (bass) track (mono). Prefer pYIN with voiced probability.
+    try:
+        f0, v_flag, v_prob = librosa.pyin(y, fmin=50, fmax=220, sr=sr)
+        # Replace NaNs with 0
+        f0 = np.nan_to_num(f0, nan=0.0)
+    except Exception:
+        try:
+            f0 = librosa.yin(y, fmin=50, fmax=220, sr=sr)
+        except Exception:
+            f0 = np.zeros(1, dtype=float)
     onset_env = librosa.onset.onset_strength(y=y, sr=sr)
     tempo, beats = librosa.beat.beat_track(y=y, sr=sr)
     if beats.size == 0:
@@ -457,10 +468,12 @@ def _compute_beatsynced_chroma(y: np.ndarray, sr: int) -> Tuple[np.ndarray, np.n
             np.asarray(onset_pools, dtype=float),
             mel_bs,
             np.asarray(f0_pools, dtype=float),
+            np.stack(pools, axis=1),  # fallback: use main chroma as bass chroma in no-beat case
         )
     beat_chroma = librosa.util.sync(chroma, beats, aggregate=np.mean)
+    beat_bass_chroma = librosa.util.sync(bass_chroma, beats, aggregate=np.mean)
     # Keep mel and f0 at original frame-rate; we will sample them at beat frames
-    return beat_chroma, beats, float(tempo), onset_env, mel, f0
+    return beat_chroma, beats, float(tempo), onset_env, mel, f0, beat_bass_chroma
 
 
 def _estimate_key_from_chroma(chroma: np.ndarray) -> Tuple[str, str]:
