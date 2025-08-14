@@ -332,6 +332,28 @@ def _analyze_path(
         debug_dict=debug_payload,
     )
 
+    # Apply measure-level aggregation to chord progression for better structural analysis
+    if selected_bpb and len(beat_chords) >= selected_bpb:
+        print(f"[DEBUG] Applying measure-level aggregation with {selected_bpb} beats per bar...")
+        print(f"[DEBUG] Input beat_chords length: {len(beat_chords)}")
+        
+        # For AISU mode, apply the AISU chord mapping logic to beat_chords first
+        if use_aisu_enabled and AISU_AVAILABLE:
+            try:
+                from .aisu_chord_detection import _apply_i_iv_v_bias_aisu
+                print("[DEBUG] Applying AISU chord mapping to beat_chords for measure-level analysis...")
+                beat_chords = _apply_i_iv_v_bias_aisu(beat_chords)
+                print(f"[DEBUG] AISU-enhanced beat_chords: {len(beat_chords)} chords")
+            except Exception as e:
+                print(f"[DEBUG] AISU chord mapping failed: {e}")
+        
+        # Use the beat_chords (with AISU enhancements) and aggregate them to measure level
+        measure_level_chords = _aggregate_to_measure_level(beat_chords, selected_bpb)
+        
+        # Update the chords_progression to use measure-level detection
+        chords_progression = measure_level_chords
+        print(f"[DEBUG] Final measure-level chords: {chords_progression}")
+
     # Form labels
     form_labels = _infer_form_from_chords(beat_chords, phrase_len=selected_bpb)
 
@@ -527,6 +549,45 @@ def _collapse_repeats(seq: List[str]) -> List[str]:
             out.append(x)
             prev = x
     return out
+
+
+def _aggregate_to_measure_level(chords: List[str], beats_per_bar: int = 4) -> List[str]:
+    """
+    Aggregate beat-level chords to measure-level by finding the most common chord in each measure.
+    This helps detect sustained chords that are held for multiple beats/measures.
+    """
+    if not chords or beats_per_bar <= 0:
+        return chords
+    
+    measure_chords = []
+    
+    for i in range(0, len(chords), beats_per_bar):
+        measure_slice = chords[i:i + beats_per_bar]
+        
+        if not measure_slice:
+            continue
+            
+        # Count chord occurrences in this measure
+        chord_counts = {}
+        for chord in measure_slice:
+            chord_counts[chord] = chord_counts.get(chord, 0) + 1
+        
+        # Find the most common chord in this measure
+        most_common_chord = max(chord_counts.items(), key=lambda x: x[1])[0]
+        measure_chords.append(most_common_chord)
+        
+        # Debug info for measure-level detection
+        if len(set(measure_slice)) == 1:
+            # Sustained chord - ideal case
+            print(f"[DEBUG] Measure {len(measure_chords)}: Sustained {most_common_chord} for {len(measure_slice)} beats")
+        else:
+            # Mixed chords - show what we're aggregating
+            print(f"[DEBUG] Measure {len(measure_chords)}: Mixed chords {measure_slice} -> chose {most_common_chord}")
+    
+    print(f"[DEBUG] Measure-level aggregation: {len(chords)} beats -> {len(measure_chords)} measures")
+    print(f"[DEBUG] Measure-level chords: {measure_chords}")
+    
+    return measure_chords
 
 
 def _infer_form_from_chords(beat_chords: List[str], phrase_len: int = 4) -> List[str]:

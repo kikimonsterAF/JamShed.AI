@@ -451,7 +451,11 @@ def _apply_i_iv_v_bias_aisu(chords: List[str]) -> List[str]:
                 vi_chord = note_names[(tonic_idx + 9) % 12] + 'm'  # vi minor
                 vii_chord = note_names[(tonic_idx + 11) % 12] + 'dim'  # vii diminished
                 
+                # Mixolydian modal chord: ♭VII major (common in modal rock/folk)
+                bvii_chord = note_names[(tonic_idx + 10) % 12]  # ♭VII major (Mixolydian)
+                
                 print(f"[DEBUG] AISU major key diatonic chords: I={i_chord}, ii={ii_chord}, iii={iii_chord}, IV={iv_chord}, V={v_chord}, vi={vi_chord}, vii°={vii_chord}")
+                print(f"[DEBUG] AISU modal chord (Mixolydian): ♭VII={bvii_chord}")
             
             # Apply intelligent mapping for major or minor key
             biased_chords = []
@@ -468,8 +472,8 @@ def _apply_i_iv_v_bias_aisu(chords: List[str]) -> List[str]:
                     secondary_chords = [ii_chord, vii_chord]  # ii°-VII - less common but important
                     complex_chords = []  # Allow all diatonic chords in minor keys
                 else:
-                    # Major key: prioritize I-IV-V-vi, be conservative with ii-iii-vii°
-                    primary_chords = [i_chord, iv_chord, v_chord, vi_chord]  # I-IV-V-vi
+                    # Major key: prioritize I-IV-V-vi-♭VII (include Mixolydian), be conservative with ii-iii-vii°
+                    primary_chords = [i_chord, iv_chord, v_chord, vi_chord, bvii_chord]  # I-IV-V-vi-♭VII (Mixolydian)
                     secondary_chords = [ii_chord, iii_chord]  # ii-iii - sometimes present
                     complex_chords = [vii_chord]  # vii° - rare in simple songs
                 
@@ -527,6 +531,9 @@ def _apply_i_iv_v_bias_aisu(chords: List[str]) -> List[str]:
                             biased_chords.append(v_chord)  # V major
                         elif root == note_names[(tonic_idx + 9) % 12] and 'm' in chord:
                             biased_chords.append(vi_chord)  # vi minor
+                        elif root == note_names[(tonic_idx + 10) % 12] and 'm' not in chord:
+                            # ♭VII major chord - Mixolydian modal characteristic
+                            biased_chords.append(bvii_chord)  # ♭VII major (Mixolydian)
                         else:
                             # Conservative fallback: map ambiguous chords to tonic
                             biased_chords.append(i_chord)
