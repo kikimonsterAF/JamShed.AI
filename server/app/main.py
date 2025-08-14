@@ -239,7 +239,7 @@ def _analyze_path(
         raise HTTPException(status_code=400, detail=f"Failed to decode audio (path={src_path}, size={size}). Ensure FFmpeg/ffprobe are available and the media is valid.")
 
     # Chroma features and beat-synchronous pooling
-    chroma, beat_frames, tempo = _compute_beatsynced_chroma(y, sr)
+    chroma, beat_frames, tempo, onset_env = _compute_beatsynced_chroma(y, sr)
 
     # Key estimation
     key_center, key_mode = _estimate_key_from_chroma(chroma)
@@ -319,7 +319,12 @@ def _analyze_path(
                 user_bpb = num
         except Exception:
             user_bpb = None
-    selected_bpb = user_bpb or _select_phrase_len(beat_chords, tempo=tempo)
+    selected_bpb = user_bpb or _auto_select_beats_per_bar(
+        beat_chords=beat_chords,
+        beat_frames=beat_frames,
+        onset_env=onset_env,
+        candidates=(2, 3, 4),
+    )
 
     # Form labels
     form_labels = _infer_form_from_chords(beat_chords, phrase_len=selected_bpb)
@@ -408,19 +413,24 @@ def _decode_audio_with_ffmpeg(src_path: str, target_sr: int = 22050) -> Tuple[np
             pass
 
 
-def _compute_beatsynced_chroma(y: np.ndarray, sr: int) -> Tuple[np.ndarray, np.ndarray, float]:
-    """Compute chroma-cqt and aggregate per beat for chord inference. Returns (chroma, beats, tempo)."""
+def _compute_beatsynced_chroma(y: np.ndarray, sr: int) -> Tuple[np.ndarray, np.ndarray, float, np.ndarray]:
+    """Compute chroma-cqt and aggregate per beat for chord inference.
+    Returns (beat_synced_chroma, beat_frames, tempo, onset_envelope).
+    """
     y = librosa.effects.harmonic(y)
     chroma = librosa.feature.chroma_cqt(y=y, sr=sr)
+    onset_env = librosa.onset.onset_strength(y=y, sr=sr)
     tempo, beats = librosa.beat.beat_track(y=y, sr=sr)
     if beats.size == 0:
         # Fallback: frame-wise pooling into fixed windows
         frames = chroma.shape[1]
         window = max(1, frames // 32)
         pools = [chroma[:, i : i + window].mean(axis=1) for i in range(0, frames, window)]
-        return np.stack(pools, axis=1), np.arange(len(pools)), 120.0  # Default tempo fallback
+        # Approximate onset envelope at pooled resolution
+        onset_pools = [onset_env[i : i + window].mean() for i in range(0, len(onset_env), window)]
+        return np.stack(pools, axis=1), np.arange(len(pools)), 120.0, np.asarray(onset_pools, dtype=float)
     beat_chroma = librosa.util.sync(chroma, beats, aggregate=np.mean)
-    return beat_chroma, beats, float(tempo)
+    return beat_chroma, beats, float(tempo), onset_env
 
 
 def _estimate_key_from_chroma(chroma: np.ndarray) -> Tuple[str, str]:
@@ -637,4 +647,84 @@ def _detect_waltz_characteristics(beat_chords: List[str], tempo: Optional[float]
     
     return waltz_detected
 
+
+def _score_phrase_len(beat_chords: List[str], n: int) -> float:
+    """Higher-is-better score for phrase repetition with bar length n."""
+    if not beat_chords or n <= 0:
+        return 0.0
+    total = len(beat_chords)
+    segments = [tuple(beat_chords[i : i + n]) for i in range(0, total, n)]
+    if not segments:
+        return 0.0
+    unique = len(set(segments))
+    unique_ratio = unique / max(1, len(segments))
+    remainder_penalty = (total % n) / n
+    raw = unique_ratio + remainder_penalty  # lower is better
+    return 1.0 / (1e-6 + raw)
+
+
+def _score_meter_accent(
+    beat_chords: List[str], beat_frames: np.ndarray, onset_env: np.ndarray, n: int
+) -> float:
+    """Score how well meter n fits onset accents and chord-change alignment (higher is better)."""
+    if n <= 0 or len(beat_chords) == 0 or beat_frames.size == 0:
+        return 0.0
+    positions = np.arange(len(beat_chords)) % n
+    if onset_env.ndim == 0:
+        return 0.0
+    # Sample onset env per beat
+    beat_onsets: List[float] = []
+    last_idx = onset_env.shape[0] - 1
+    for f in beat_frames:
+        idx = int(f)
+        if idx < 0:
+            idx = 0
+        if idx > last_idx:
+            idx = last_idx
+        beat_onsets.append(float(onset_env[idx]))
+    beat_onsets = np.asarray(beat_onsets, dtype=float)
+    if len(beat_onsets) != len(positions):
+        L = min(len(beat_onsets), len(positions))
+        beat_onsets = beat_onsets[:L]
+        positions = positions[:L]
+    pos0 = beat_onsets[positions == 0]
+    pos_other = beat_onsets[positions != 0]
+    if pos0.size == 0 or pos_other.size == 0:
+        downbeat_contrast = 0.0
+    else:
+        downbeat_contrast = (pos0.mean() - pos_other.mean()) / (1e-6 + beat_onsets.mean())
+        downbeat_contrast = max(downbeat_contrast, 0.0)
+    # Chord change alignment
+    changes = [i for i in range(1, len(beat_chords)) if beat_chords[i] != beat_chords[i - 1]]
+    if not changes:
+        change_alignment = 0.0
+    else:
+        aligned = sum(1 for i in changes if (i % n) == 0)
+        change_alignment = aligned / len(changes)
+    return 0.6 * downbeat_contrast + 0.4 * change_alignment
+
+
+def _auto_select_beats_per_bar(
+    beat_chords: List[str], beat_frames: np.ndarray, onset_env: np.ndarray, candidates: Tuple[int, ...] = (2, 3, 4)
+) -> int:
+    """Blend phrase repetition with rhythmic accent/chord-change alignment to pick the meter."""
+    if not beat_chords:
+        return 4
+    phrase_scores = {n: _score_phrase_len(beat_chords, n) for n in candidates}
+    accent_scores = {n: _score_meter_accent(beat_chords, beat_frames, onset_env, n) for n in candidates}
+    def normalize(d: dict) -> dict:
+        vals = list(d.values())
+        if not vals:
+            return {k: 0.0 for k in d}
+        vmin, vmax = min(vals), max(vals)
+        if vmax - vmin < 1e-9:
+            return {k: 0.0 for k in d}
+        return {k: (v - vmin) / (vmax - vmin) for k, v in d.items()}
+    phrase_n = normalize(phrase_scores)
+    accent_n = normalize(accent_scores)
+    total_scores = {n: 0.4 * phrase_n.get(n, 0.0) + 0.6 * accent_n.get(n, 0.0) for n in candidates}
+    print(f"[DEBUG] 🥁 Meter scoring - phrase={phrase_scores}, accent={accent_scores}, total={total_scores}")
+    best_n = max(total_scores.items(), key=lambda kv: (kv[1], kv[0] == 4, kv[0] == 3))[0]
+    print(f"[DEBUG] 🥁 Auto meter selection -> {best_n}/4")
+    return int(best_n)
 
