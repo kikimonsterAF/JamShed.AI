@@ -666,7 +666,15 @@ def _score_phrase_len(beat_chords: List[str], n: int) -> float:
 def _score_meter_accent(
     beat_chords: List[str], beat_frames: np.ndarray, onset_env: np.ndarray, n: int
 ) -> float:
-    """Score how well meter n fits onset accents and chord-change alignment (higher is better)."""
+    """Score how well meter n fits expected accent patterns using onset/chord-change profiles.
+
+    Steps:
+    - Aggregate onset envelope per beat and fold by bar position (0..n-1)
+    - Compute chord-change frequency per bar position
+    - Build a position profile vector by blending onset means and change frequencies
+    - Compare against expected accent templates via cosine similarity
+    Returns higher-is-better score.
+    """
     if n <= 0 or len(beat_chords) == 0 or beat_frames.size == 0:
         return 0.0
     positions = np.arange(len(beat_chords)) % n
@@ -687,21 +695,67 @@ def _score_meter_accent(
         L = min(len(beat_onsets), len(positions))
         beat_onsets = beat_onsets[:L]
         positions = positions[:L]
-    pos0 = beat_onsets[positions == 0]
-    pos_other = beat_onsets[positions != 0]
-    if pos0.size == 0 or pos_other.size == 0:
-        downbeat_contrast = 0.0
+
+    # Per-position onset means
+    onset_means = np.zeros(n, dtype=float)
+    counts = np.zeros(n, dtype=float)
+    for val, pos in zip(beat_onsets, positions):
+        onset_means[int(pos)] += val
+        counts[int(pos)] += 1.0
+    onset_means = onset_means / np.maximum(counts, 1e-6)
+    if onset_means.sum() > 0:
+        onset_means = onset_means / (onset_means.sum() + 1e-9)
+
+    # Per-position chord-change frequency
+    changes = [i for i in range(1, len(beat_chords)) if beat_chords[i] != beat_chords[i - 1]]
+    change_freq = np.zeros(n, dtype=float)
+    if changes:
+        for i in changes:
+            change_freq[int(i % n)] += 1.0
+        change_freq = change_freq / (change_freq.sum() + 1e-9)
+
+    # Blend onset and change profiles (favor chord-change structure over raw accents)
+    alpha = 0.3
+    profile = alpha * onset_means + (1.0 - alpha) * change_freq
+    if profile.sum() > 0:
+        profile = profile / (profile.sum() + 1e-9)
+
+    # Expected accent templates (normalized)
+    if n == 2:
+        template = np.array([1.0, 0.5], dtype=float)
+    elif n == 3:
+        template = np.array([1.0, 0.3, 0.3], dtype=float)
+    elif n == 4:
+        template = np.array([1.0, 0.3, 0.6, 0.3], dtype=float)  # strong-weak-medium-weak
     else:
-        downbeat_contrast = (pos0.mean() - pos_other.mean()) / (1e-6 + beat_onsets.mean())
-        downbeat_contrast = max(downbeat_contrast, 0.0)
-    # Chord change alignment
+        # For other meters, fallback to downbeat emphasis only
+        template = np.zeros(n, dtype=float)
+        template[0] = 1.0
+    template = template / (template.sum() + 1e-9)
+
+    # Cosine similarity between profile and template
+    denom = (np.linalg.norm(profile) * np.linalg.norm(template)) + 1e-9
+    cos_sim = float(np.dot(profile, template) / denom)
+
+    # Small preference to meters that reduce remainder (stability)
+    remainder_bonus = 0.0
+    total = len(beat_chords)
+    remainder = total % n
+    remainder_bonus = 1.0 - (remainder / max(1, n))  # closer to full bars is better
+
+    # Final score
+    return 0.8 * cos_sim + 0.2 * remainder_bonus
+
+
+def _change_alignment_ratio(beat_chords: List[str], n: int) -> float:
+    """Return fraction of chord changes that land on bar start for meter n."""
+    if n <= 0 or not beat_chords:
+        return 0.0
     changes = [i for i in range(1, len(beat_chords)) if beat_chords[i] != beat_chords[i - 1]]
     if not changes:
-        change_alignment = 0.0
-    else:
-        aligned = sum(1 for i in changes if (i % n) == 0)
-        change_alignment = aligned / len(changes)
-    return 0.6 * downbeat_contrast + 0.4 * change_alignment
+        return 0.0
+    aligned = sum(1 for i in changes if (i % n) == 0)
+    return aligned / len(changes)
 
 
 def _auto_select_beats_per_bar(
@@ -723,8 +777,24 @@ def _auto_select_beats_per_bar(
     phrase_n = normalize(phrase_scores)
     accent_n = normalize(accent_scores)
     total_scores = {n: 0.4 * phrase_n.get(n, 0.0) + 0.6 * accent_n.get(n, 0.0) for n in candidates}
-    print(f"[DEBUG] 🥁 Meter scoring - phrase={phrase_scores}, accent={accent_scores}, total={total_scores}")
-    best_n = max(total_scores.items(), key=lambda kv: (kv[1], kv[0] == 4, kv[0] == 3))[0]
-    print(f"[DEBUG] 🥁 Auto meter selection -> {best_n}/4")
+
+    # Apply conservative gate for selecting 3/4: require strong bar-start change alignment
+    if 3 in candidates and 3 in total_scores:
+        align3 = _change_alignment_ratio(beat_chords, 3)
+        if align3 < 0.6:
+            total_scores[3] *= 0.6  # penalize if not enough 3-beat alignment
+        print(f"[DEBUG] 🥁 3/4 alignment ratio={align3:.2f} (>=0.60 required to avoid penalty)")
+
+    print(f"[DEBUG] 🥁 Meter scoring - phrase={phrase_scores}, accent={accent_scores}, total(pre)={total_scores}")
+
+    # Require margin for 3/4 over others to reduce false positives
+    if 3 in total_scores:
+        best_other = max([v for k, v in total_scores.items() if k != 3] or [0.0])
+        if total_scores[3] < best_other + 0.10:
+            # Slightly dampen 3/4 if it doesn't clearly win
+            total_scores[3] *= 0.9
+
+    best_n = max(total_scores.items(), key=lambda kv: (kv[1], kv[0] == 4, kv[0] == 2))[0]
+    print(f"[DEBUG] 🥁 Auto meter selection -> {best_n}/4 (scores={total_scores})")
     return int(best_n)
 
