@@ -898,6 +898,28 @@ def _auto_select_beats_per_bar(
         p_ch = _norm_autocorr_at_lag(changes_imp, n) if changes_imp.size else 0.0
         # Weighted average
         periodicity_scores[n] = 0.4 * p_on + 0.3 * p_fx + 0.3 * p_ch
+
+    # Run-length multiples score: favor meters where chord runs are multiples of n
+    def _run_multiple_fraction(beat_chords_local: List[str], n_local: int) -> float:
+        if n_local <= 0 or not beat_chords_local:
+            return 0.0
+        runs: List[int] = []
+        cur = beat_chords_local[0]
+        cnt = 1
+        for x in beat_chords_local[1:]:
+            if x == cur:
+                cnt += 1
+            else:
+                runs.append(cnt)
+                cur = x
+                cnt = 1
+        runs.append(cnt)
+        if not runs:
+            return 0.0
+        mult = sum(1 for r in runs if (r % n_local) == 0)
+        return mult / len(runs)
+
+    runmult_scores = {n: _run_multiple_fraction(beat_chords, n) for n in candidates}
     def normalize(d: dict) -> dict:
         vals = list(d.values())
         if not vals:
@@ -911,13 +933,15 @@ def _auto_select_beats_per_bar(
     homo_n = normalize(homo_scores)
     flux_n = normalize(flux_scores)
     periodicity_n = normalize(periodicity_scores)
-    # Blend: accent (0.3) + homogeneity (0.3) + flux (0.2) + periodicity (0.15) + phrase (0.05)
+    runmult_n = normalize(runmult_scores)
+    # Blend: accent (0.28) + homogeneity (0.25) + flux (0.18) + periodicity (0.14) + run-multiples (0.10) + phrase (0.05)
     total_scores = {
         n: 0.05 * phrase_n.get(n, 0.0)
-        + 0.30 * accent_n.get(n, 0.0)
-        + 0.30 * homo_n.get(n, 0.0)
-        + 0.20 * flux_n.get(n, 0.0)
-        + 0.15 * periodicity_n.get(n, 0.0)
+        + 0.28 * accent_n.get(n, 0.0)
+        + 0.25 * homo_n.get(n, 0.0)
+        + 0.18 * flux_n.get(n, 0.0)
+        + 0.14 * periodicity_n.get(n, 0.0)
+        + 0.10 * runmult_n.get(n, 0.0)
         for n in candidates
     }
 
@@ -928,7 +952,7 @@ def _auto_select_beats_per_bar(
             total_scores[3] *= 0.6  # penalize if not enough 3-beat alignment
         print(f"[DEBUG] 🥁 3/4 alignment ratio={align3:.2f} (>=0.60 required to avoid penalty)")
 
-    print(f"[DEBUG] 🥁 Meter scoring - phrase={phrase_scores}, accent={accent_scores}, homo={homo_scores}, flux={flux_scores}, periodicity={periodicity_scores}, total(pre)={total_scores}")
+    print(f"[DEBUG] 🥁 Meter scoring - phrase={phrase_scores}, accent={accent_scores}, homo={homo_scores}, flux={flux_scores}, periodicity={periodicity_scores}, runmult={runmult_scores}, total(pre)={total_scores}")
 
     # Require margin for 3/4 over others to reduce false positives
     if 3 in total_scores:
