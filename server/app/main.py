@@ -519,69 +519,121 @@ def _select_phrase_len(beat_chords: List[str], candidates: Tuple[int, ...] = (2,
         
         # Apply waltz bias - strongly favor 3/4 time for waltz-like songs
         if waltz_bias and n == 3:
-            score *= 0.7  # 30% bonus for 3/4 time when waltz detected
-            print(f"[DEBUG] 🎼 Waltz detected! Applying 3/4 bias, score: {score:.3f}")
+            score *= 0.1  # 90% bonus for 3/4 time when waltz detected (very aggressive)
+            print(f"[DEBUG] 🎼 Waltz detected! Applying VERY strong 3/4 bias, score: {score:.3f}")
+        elif waltz_bias and n != 3:
+            score *= 1.5  # Penalize non-3/4 time when waltz detected
+            print(f"[DEBUG] 🎼 Waltz detected! Penalizing {n}/4 time, score: {score:.3f}")
         
         if score < best_score:
             best_score = score
             best_len = n
     
-    print(f"[DEBUG] 🥁 Beat detection - Selected: {best_len}/4, Waltz bias: {waltz_bias}")
+    print(f"[DEBUG] 🥁 Beat detection - Tempo: {tempo}, Selected: {best_len}/4, Waltz bias: {waltz_bias}")
     return best_len
 
 
 def _detect_waltz_characteristics(beat_chords: List[str], tempo: Optional[float] = None) -> bool:
-    """Detect if this song has waltz-like characteristics (3/4 time)."""
+    """Detect if this song has waltz-like characteristics (3/4 time) based on harmonic patterns."""
     if not beat_chords or len(beat_chords) < 12:
+        print(f"[DEBUG] 🎼 Waltz detection: skipping - not enough chords ({len(beat_chords) if beat_chords else 0})")
         return False
     
-    # Waltz tempo range (typically 60-180 BPM for dotted quarter note)
-    tempo_suggests_waltz = False
-    if tempo is not None:
-        # For 3/4 waltzes, tempo is often 60-180 BPM (moderate waltz range)
-        tempo_suggests_waltz = 60 <= tempo <= 180
+    print(f"[DEBUG] 🎼 Waltz detection: analyzing {len(beat_chords)} beat chords (ignoring tempo)")
     
-    # Check for 3-beat patterns in chord progression
-    # Waltzes often have ONE chord per measure (3 beats), creating strong 3-beat groupings
-    three_beat_segments = [tuple(beat_chords[i:i+3]) for i in range(0, len(beat_chords) - 2, 3)]
-    if len(three_beat_segments) < 4:
-        return False
+    waltz_score = 0
+    total_tests = 0
     
-    # Look for patterns where chord changes happen every 3 beats
-    # Count segments where first beat has different chord from previous segment's first beat
-    chord_changes_every_3 = 0
-    total_segments = len(three_beat_segments)
+    # Test 1: Does the song length divide better by 3 than by 2 or 4?
+    total_tests += 1
+    length = len(beat_chords)
+    remainder_3 = length % 3
+    remainder_2 = length % 2
+    remainder_4 = length % 4
     
-    for i in range(1, total_segments):
-        prev_segment = three_beat_segments[i-1]
-        curr_segment = three_beat_segments[i]
-        # Check if chord changes at the beginning of 3-beat phrase
-        if prev_segment[0] != curr_segment[0]:
-            chord_changes_every_3 += 1
+    if remainder_3 <= remainder_2 and remainder_3 <= remainder_4:
+        waltz_score += 1
+        print(f"[DEBUG] 🎼 Length test: {length} chords, 3-beat remainder={remainder_3} wins vs 2-beat={remainder_2}, 4-beat={remainder_4}")
+    else:
+        print(f"[DEBUG] 🎼 Length test: {length} chords, 3-beat remainder={remainder_3} loses vs 2-beat={remainder_2}, 4-beat={remainder_4}")
     
-    # If >50% of segments start with chord changes, suggests 3/4 time
-    chord_change_ratio = chord_changes_every_3 / max(1, total_segments - 1)
-    strong_3_beat_pattern = chord_change_ratio > 0.4
+    # Test 2: Chord change patterns - do chords change in 3-beat groups?
+    total_tests += 1
+    three_beat_groups = []
+    for i in range(0, len(beat_chords) - 2, 3):
+        if i + 2 < len(beat_chords):
+            group = beat_chords[i:i+3]
+            three_beat_groups.append(group)
     
-    # Additional check: repetitive 3-beat patterns with minimal variation
-    unique_3_segments = len(set(three_beat_segments))
-    repetition_3_ratio = unique_3_segments / max(1, len(three_beat_segments))
+    if len(three_beat_groups) >= 4:
+        # Count how often the first beat of each 3-beat group has a different chord
+        chord_changes_on_downbeat = 0
+        for i in range(1, len(three_beat_groups)):
+            if three_beat_groups[i][0] != three_beat_groups[i-1][0]:
+                chord_changes_on_downbeat += 1
+        
+        change_ratio = chord_changes_on_downbeat / max(1, len(three_beat_groups) - 1)
+        if change_ratio > 0.4:  # At least 40% of measures start with chord changes
+            waltz_score += 1
+            print(f"[DEBUG] 🎼 Chord change pattern: {change_ratio:.2f} measures start with new chords (good for waltz)")
+        else:
+            print(f"[DEBUG] 🎼 Chord change pattern: {change_ratio:.2f} measures start with new chords (weak for waltz)")
     
-    # Compare with 2-beat and 4-beat patterns
-    two_beat_segments = [tuple(beat_chords[i:i+2]) for i in range(0, len(beat_chords) - 1, 2)]
-    unique_2_segments = len(set(two_beat_segments))
-    repetition_2_ratio = unique_2_segments / max(1, len(two_beat_segments))
+    # Test 3: Repeated chord patterns in 3-beat groups
+    total_tests += 1
+    if len(three_beat_groups) >= 4:
+        unique_3_patterns = len(set(tuple(group) for group in three_beat_groups))
+        repetition_ratio = unique_3_patterns / len(three_beat_groups)
+        
+        # Compare with 2-beat patterns
+        two_beat_groups = []
+        for i in range(0, len(beat_chords) - 1, 2):
+            if i + 1 < len(beat_chords):
+                group = beat_chords[i:i+2]
+                two_beat_groups.append(tuple(group))
+        
+        if two_beat_groups:
+            unique_2_patterns = len(set(two_beat_groups))
+            repetition_ratio_2 = unique_2_patterns / len(two_beat_groups)
+            
+            # Waltzes often have more repetitive 3-beat patterns than 2-beat patterns
+            if repetition_ratio < repetition_ratio_2:
+                waltz_score += 1
+                print(f"[DEBUG] 🎼 Pattern repetition: 3-beat={repetition_ratio:.2f} more repetitive than 2-beat={repetition_ratio_2:.2f}")
+            else:
+                print(f"[DEBUG] 🎼 Pattern repetition: 3-beat={repetition_ratio:.2f} less repetitive than 2-beat={repetition_ratio_2:.2f}")
     
-    # Waltz is more likely if 3-beat patterns are more repetitive than 2-beat
-    pattern_suggests_waltz = repetition_3_ratio < repetition_2_ratio
+    # Test 4: Long chord holds (waltzes often hold chords for 3 or 6 beats)
+    total_tests += 1
+    chord_runs = []
+    current_chord = beat_chords[0]
+    current_run = 1
     
-    waltz_detected = strong_3_beat_pattern or pattern_suggests_waltz
-    if tempo_suggests_waltz:
-        waltz_detected = True  # Tempo is strong indicator
+    for i in range(1, len(beat_chords)):
+        if beat_chords[i] == current_chord:
+            current_run += 1
+        else:
+            if current_run > 1:
+                chord_runs.append(current_run)
+            current_chord = beat_chords[i]
+            current_run = 1
     
-    print(f"[DEBUG] 🎼 Waltz analysis: tempo={tempo}, 3-beat changes={chord_change_ratio:.2f}, "
-          f"3-beat repetition={repetition_3_ratio:.2f}, 2-beat repetition={repetition_2_ratio:.2f}, "
-          f"detected={waltz_detected}")
+    if current_run > 1:
+        chord_runs.append(current_run)
+    
+    # Count runs that are multiples of 3
+    three_beat_runs = sum(1 for run in chord_runs if run % 3 == 0)
+    if chord_runs and three_beat_runs / len(chord_runs) > 0.3:
+        waltz_score += 1
+        print(f"[DEBUG] 🎼 Chord holds: {three_beat_runs}/{len(chord_runs)} are 3-beat multiples")
+    else:
+        print(f"[DEBUG] 🎼 Chord holds: {three_beat_runs}/{len(chord_runs) if chord_runs else 0} are 3-beat multiples (weak)")
+    
+    # Final decision - balanced threshold to catch waltzes but avoid false positives
+    threshold = max(2, int(total_tests * 0.6))  # Need at least 60% of tests to pass
+    waltz_detected = waltz_score >= threshold
+    
+    print(f"[DEBUG] 🎼 Waltz verdict: {waltz_score}/{total_tests} tests passed, threshold={threshold}, detected={waltz_detected}")
     
     return waltz_detected
 
