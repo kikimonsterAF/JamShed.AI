@@ -239,7 +239,7 @@ def _analyze_path(
         raise HTTPException(status_code=400, detail=f"Failed to decode audio (path={src_path}, size={size}). Ensure FFmpeg/ffprobe are available and the media is valid.")
 
     # Chroma features and beat-synchronous pooling
-    chroma, beat_frames, tempo, onset_env = _compute_beatsynced_chroma(y, sr)
+    chroma, beat_frames, tempo, onset_env, mel = _compute_beatsynced_chroma(y, sr)
 
     # Key estimation
     key_center, key_mode = _estimate_key_from_chroma(chroma)
@@ -324,6 +324,7 @@ def _analyze_path(
         beat_frames=beat_frames,
         onset_env=onset_env,
         candidates=(2, 3, 4),
+        mel=mel,
     )
 
     # Form labels
@@ -413,12 +414,13 @@ def _decode_audio_with_ffmpeg(src_path: str, target_sr: int = 22050) -> Tuple[np
             pass
 
 
-def _compute_beatsynced_chroma(y: np.ndarray, sr: int) -> Tuple[np.ndarray, np.ndarray, float, np.ndarray]:
+def _compute_beatsynced_chroma(y: np.ndarray, sr: int) -> Tuple[np.ndarray, np.ndarray, float, np.ndarray, np.ndarray]:
     """Compute chroma-cqt and aggregate per beat for chord inference.
     Returns (beat_synced_chroma, beat_frames, tempo, onset_envelope).
     """
     y = librosa.effects.harmonic(y)
     chroma = librosa.feature.chroma_cqt(y=y, sr=sr)
+    mel = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=64)
     onset_env = librosa.onset.onset_strength(y=y, sr=sr)
     tempo, beats = librosa.beat.beat_track(y=y, sr=sr)
     if beats.size == 0:
@@ -428,9 +430,13 @@ def _compute_beatsynced_chroma(y: np.ndarray, sr: int) -> Tuple[np.ndarray, np.n
         pools = [chroma[:, i : i + window].mean(axis=1) for i in range(0, frames, window)]
         # Approximate onset envelope at pooled resolution
         onset_pools = [onset_env[i : i + window].mean() for i in range(0, len(onset_env), window)]
-        return np.stack(pools, axis=1), np.arange(len(pools)), 120.0, np.asarray(onset_pools, dtype=float)
+        # Approximate mel pooling
+        mel_pools = [mel[:, i : i + window].mean(axis=1) for i in range(0, mel.shape[1], window)]
+        mel_bs = np.stack(mel_pools, axis=1) if mel_pools else np.zeros((64, 1), dtype=float)
+        return np.stack(pools, axis=1), np.arange(len(pools)), 120.0, np.asarray(onset_pools, dtype=float), mel_bs
     beat_chroma = librosa.util.sync(chroma, beats, aggregate=np.mean)
-    return beat_chroma, beats, float(tempo), onset_env
+    # Keep mel at original frame-rate; we will sample it at beat frames
+    return beat_chroma, beats, float(tempo), onset_env, mel
 
 
 def _estimate_key_from_chroma(chroma: np.ndarray) -> Tuple[str, str]:
@@ -759,13 +765,78 @@ def _change_alignment_ratio(beat_chords: List[str], n: int) -> float:
 
 
 def _auto_select_beats_per_bar(
-    beat_chords: List[str], beat_frames: np.ndarray, onset_env: np.ndarray, candidates: Tuple[int, ...] = (2, 3, 4)
+    beat_chords: List[str], beat_frames: np.ndarray, onset_env: np.ndarray, candidates: Tuple[int, ...] = (2, 3, 4), mel: Optional[np.ndarray] = None
 ) -> int:
     """Blend phrase repetition with rhythmic accent/chord-change alignment to pick the meter."""
     if not beat_chords:
         return 4
     phrase_scores = {n: _score_phrase_len(beat_chords, n) for n in candidates}
     accent_scores = {n: _score_meter_accent(beat_chords, beat_frames, onset_env, n) for n in candidates}
+
+    # Bar homogeneity: for each bar, fewer within-bar chord changes is better for that meter
+    def _score_bar_homogeneity(beat_chords_local: List[str], n_local: int) -> float:
+        if n_local <= 0 or not beat_chords_local:
+            return 0.0
+        total_bars = 0
+        homogeneous = 0
+        for i in range(0, len(beat_chords_local), n_local):
+            seg = beat_chords_local[i:i+n_local]
+            if not seg:
+                continue
+            total_bars += 1
+            if all(ch == seg[0] for ch in seg):
+                homogeneous += 1
+        if total_bars == 0:
+            return 0.0
+        return homogeneous / total_bars
+
+    homo_scores = {n: _score_bar_homogeneity(beat_chords, n) for n in candidates}
+
+    # Spectral flux per beat from mel and fold by bar positions
+    flux_scores: dict = {}
+    if mel is not None and mel.size > 0 and beat_frames.size > 1:
+        # Compute spectral flux on mel frames
+        mel_db = librosa.power_to_db(mel, ref=np.max)
+        diff = np.diff(mel_db, axis=1)
+        flux = np.maximum(diff, 0.0).sum(axis=0)  # positive changes only
+        # Sample flux at beat frames
+        last_idx = flux.shape[0] - 1
+        beat_flux: List[float] = []
+        for f in beat_frames:
+            idx = int(f)
+            if idx < 1:
+                idx = 1
+            if idx > last_idx:
+                idx = last_idx
+            beat_flux.append(float(flux[idx]))
+        beat_flux = np.asarray(beat_flux, dtype=float)
+        for n in candidates:
+            if n <= 0:
+                flux_scores[n] = 0.0
+                continue
+            pos = np.arange(len(beat_flux)) % n
+            pos_means = np.zeros(n, dtype=float)
+            counts = np.zeros(n, dtype=float)
+            for val, p in zip(beat_flux, pos):
+                pos_means[int(p)] += val
+                counts[int(p)] += 1.0
+            pos_means = pos_means / np.maximum(counts, 1e-6)
+            if pos_means.sum() > 0:
+                pos_means = pos_means / (pos_means.sum() + 1e-9)
+            # Compare to expected templates (same as accent templates)
+            if n == 2:
+                tmpl = np.array([1.0, 0.5])
+            elif n == 3:
+                tmpl = np.array([1.0, 0.3, 0.3])
+            elif n == 4:
+                tmpl = np.array([1.0, 0.3, 0.6, 0.3])
+            else:
+                tmpl = np.zeros(n); tmpl[0] = 1.0
+            tmpl = tmpl / (tmpl.sum() + 1e-9)
+            denom = (np.linalg.norm(pos_means) * np.linalg.norm(tmpl)) + 1e-9
+            flux_scores[n] = float(np.dot(pos_means, tmpl) / denom)
+    else:
+        flux_scores = {n: 0.0 for n in candidates}
     def normalize(d: dict) -> dict:
         vals = list(d.values())
         if not vals:
@@ -776,7 +847,16 @@ def _auto_select_beats_per_bar(
         return {k: (v - vmin) / (vmax - vmin) for k, v in d.items()}
     phrase_n = normalize(phrase_scores)
     accent_n = normalize(accent_scores)
-    total_scores = {n: 0.4 * phrase_n.get(n, 0.0) + 0.6 * accent_n.get(n, 0.0) for n in candidates}
+    homo_n = normalize(homo_scores)
+    flux_n = normalize(flux_scores)
+    # Blend: accent (0.35) + homogeneity (0.35) + flux (0.2) + phrase (0.1)
+    total_scores = {
+        n: 0.1 * phrase_n.get(n, 0.0)
+        + 0.35 * accent_n.get(n, 0.0)
+        + 0.35 * homo_n.get(n, 0.0)
+        + 0.2 * flux_n.get(n, 0.0)
+        for n in candidates
+    }
 
     # Apply conservative gate for selecting 3/4: require strong bar-start change alignment
     if 3 in candidates and 3 in total_scores:
@@ -785,14 +865,14 @@ def _auto_select_beats_per_bar(
             total_scores[3] *= 0.6  # penalize if not enough 3-beat alignment
         print(f"[DEBUG] 🥁 3/4 alignment ratio={align3:.2f} (>=0.60 required to avoid penalty)")
 
-    print(f"[DEBUG] 🥁 Meter scoring - phrase={phrase_scores}, accent={accent_scores}, total(pre)={total_scores}")
+    print(f"[DEBUG] 🥁 Meter scoring - phrase={phrase_scores}, accent={accent_scores}, homo={homo_scores}, flux={flux_scores}, total(pre)={total_scores}")
 
     # Require margin for 3/4 over others to reduce false positives
     if 3 in total_scores:
         best_other = max([v for k, v in total_scores.items() if k != 3] or [0.0])
-        if total_scores[3] < best_other + 0.10:
-            # Slightly dampen 3/4 if it doesn't clearly win
-            total_scores[3] *= 0.9
+        # Require a small but real margin for 3/4
+        if total_scores[3] < best_other + 0.05:
+            total_scores[3] *= 0.95
 
     best_n = max(total_scores.items(), key=lambda kv: (kv[1], kv[0] == 4, kv[0] == 2))[0]
     print(f"[DEBUG] 🥁 Auto meter selection -> {best_n}/4 (scores={total_scores})")
