@@ -55,6 +55,7 @@ class AnalysisResponse(BaseModel):
     # Estimated meter information (auto or user-provided override echoed back)
     beats_per_bar: Optional[int] = None
     meter: Optional[str] = None
+    meter_debug: Optional[dict] = None
 
 
 class UsageResponse(BaseModel):
@@ -149,6 +150,7 @@ async def analyze_url(
     meter: Optional[str] = None,
     use_aisu: Optional[int] = None,
     use_deep: Optional[int] = None,
+    meter_debug: Optional[int] = None,
 ) -> AnalysisResponse:
     """Download audio from YouTube (or other supported sites) and analyze it.
     Requires yt-dlp and ffmpeg to be present.
@@ -217,6 +219,7 @@ async def analyze_url(
             meter=meter,
             use_aisu=use_aisu,
             use_deep=use_deep,
+            meter_debug=meter_debug,
         )
 
 
@@ -228,6 +231,7 @@ def _analyze_path(
     meter: Optional[str],
     use_aisu: Optional[int] = None,
     use_deep: Optional[int] = None,
+    meter_debug: Optional[int] = None,
 ) -> AnalysisResponse:
     # Decode to mono PCM WAV (22.05 kHz) via ffmpeg
     y, sr = _decode_audio_with_ffmpeg(src_path, target_sr=22050)
@@ -319,12 +323,14 @@ def _analyze_path(
                 user_bpb = num
         except Exception:
             user_bpb = None
+    debug_payload = {} if meter_debug else None
     selected_bpb = user_bpb or _auto_select_beats_per_bar(
         beat_chords=beat_chords,
         beat_frames=beat_frames,
         onset_env=onset_env,
         candidates=(2, 3, 4),
         mel=mel,
+        debug_dict=debug_payload,
     )
 
     # Form labels
@@ -349,12 +355,15 @@ def _analyze_path(
         )
 
     meter_label = f"{selected_bpb}/4" if selected_bpb else None
+    # Optional debug payload for meter selection
+    md = debug_payload if meter_debug else None
     return AnalysisResponse(
         chords=chords_progression,
         form=form_labels[:8],
         scale_suggestions=suggestions,
         beats_per_bar=selected_bpb,
         meter=meter_label,
+        meter_debug=md,
     )
 
 
@@ -765,7 +774,12 @@ def _change_alignment_ratio(beat_chords: List[str], n: int) -> float:
 
 
 def _auto_select_beats_per_bar(
-    beat_chords: List[str], beat_frames: np.ndarray, onset_env: np.ndarray, candidates: Tuple[int, ...] = (2, 3, 4), mel: Optional[np.ndarray] = None
+    beat_chords: List[str],
+    beat_frames: np.ndarray,
+    onset_env: np.ndarray,
+    candidates: Tuple[int, ...] = (2, 3, 4),
+    mel: Optional[np.ndarray] = None,
+    debug_dict: Optional[dict] = None,
 ) -> int:
     """Blend phrase repetition with rhythmic accent/chord-change alignment to pick the meter."""
     if not beat_chords:
@@ -988,6 +1002,16 @@ def _auto_select_beats_per_bar(
         print(f"[DEBUG] 🥁 3/4 alignment ratio={align3:.2f} (>=0.60 required to avoid penalty)")
 
     print(f"[DEBUG] 🥁 Meter scoring - phrase={phrase_scores}, accent={accent_scores}, homo={homo_scores}, flux={flux_scores}, periodicity={periodicity_scores}, runmult={runmult_scores}, lf={lf_scores}, total(pre)={total_scores}")
+    if debug_dict is not None:
+        debug_dict.update({
+            "phrase": phrase_scores,
+            "accent": accent_scores,
+            "homogeneity": homo_scores,
+            "flux": flux_scores,
+            "periodicity": periodicity_scores,
+            "run_multiples": runmult_scores,
+            "low_bass": lf_scores,
+        })
 
     # Require margin for 3/4 over others to reduce false positives
     if 3 in total_scores:
@@ -1017,7 +1041,17 @@ def _auto_select_beats_per_bar(
         if (align3 - align2) > 0.15 and (per3 - per2) > 0.05 and (homo3 + 1e-6) >= (homo2 - 1e-6) and (flux3 + 1e-6) >= (flux2 - 1e-6):
             print(f"[DEBUG] 🥁 Waltz override triggered: align3={align3:.2f} per3={per3:.2f} homo3={homo3:.2f} vs 2-beat align2={align2:.2f} per2={per2:.2f} homo2={homo2:.2f}")
             best_n = 3
+        if debug_dict is not None:
+            debug_dict.update({
+                "align2": align2,
+                "align3": align3,
+                "per2": per2,
+                "per3": per3,
+            })
 
     print(f"[DEBUG] 🥁 Auto meter selection -> {best_n}/4 (scores={total_scores})")
+    if debug_dict is not None:
+        debug_dict["total_scores"] = total_scores
+        debug_dict["selected"] = int(best_n)
     return int(best_n)
 
