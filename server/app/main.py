@@ -243,7 +243,7 @@ def _analyze_path(
         raise HTTPException(status_code=400, detail=f"Failed to decode audio (path={src_path}, size={size}). Ensure FFmpeg/ffprobe are available and the media is valid.")
 
     # Chroma features and beat-synchronous pooling
-    chroma, beat_frames, tempo, onset_env, mel = _compute_beatsynced_chroma(y, sr)
+    chroma, beat_frames, tempo, onset_env, mel, f0 = _compute_beatsynced_chroma(y, sr)
 
     # Key estimation
     key_center, key_mode = _estimate_key_from_chroma(chroma)
@@ -266,10 +266,9 @@ def _analyze_path(
             chords_progression = predict_chords_deep_transformer(src_path)
             print(f"[DEBUG] 🎯 DEEP TRANSFORMER returned chords: {chords_progression}")
             # Create beat-level chords for form analysis
-            beat_chords = []
-            for chord in chords_progression:
-                beat_chords.extend([chord] * 4)  # 4 beats per chord
-            print(f"[DEBUG] 🎵 Deep transformer beat_chords created: {len(beat_chords)} beats")
+            # Do NOT fabricate 4-per-chord beats for meter; keep separate beat-level chroma chords
+            beat_chords = _infer_chords_from_chroma(chroma)
+            print(f"[DEBUG] 🎵 Deep transformer: using chroma-inferred beat_chords: {len(beat_chords)} beats")
         except Exception as e:
             print(f"[DEBUG] ❌ Deep transformer failed, falling back to AISU: {e}")
             import traceback
@@ -292,11 +291,9 @@ def _analyze_path(
             print("[DEBUG] Starting AISU transformer chord detection...")
             chords_progression = predict_chords_aisu(src_path)
             print(f"[DEBUG] AISU returned chords: {chords_progression}")
-            # Create beat-level chords for form analysis (repeat each chord 4 times for 4/4)
-            beat_chords = []
-            for chord in chords_progression:
-                beat_chords.extend([chord] * 4)  # 4 beats per chord
-            print(f"[DEBUG] AISU beat_chords created: {len(beat_chords)} beats")
+            # Use chroma-derived beat-level chords for meter/form to avoid 4/4 bias
+            beat_chords = _infer_chords_from_chroma(chroma)
+            print(f"[DEBUG] AISU: using chroma-inferred beat_chords: {len(beat_chords)} beats")
         except Exception as e:
             print(f"[DEBUG] AISU chord detection failed, falling back: {e}")
             import traceback
@@ -330,6 +327,7 @@ def _analyze_path(
         onset_env=onset_env,
         candidates=(2, 3, 4),
         mel=mel,
+        f0_seq=f0,
         debug_dict=debug_payload,
     )
 
@@ -423,13 +421,18 @@ def _decode_audio_with_ffmpeg(src_path: str, target_sr: int = 22050) -> Tuple[np
             pass
 
 
-def _compute_beatsynced_chroma(y: np.ndarray, sr: int) -> Tuple[np.ndarray, np.ndarray, float, np.ndarray, np.ndarray]:
+def _compute_beatsynced_chroma(y: np.ndarray, sr: int) -> Tuple[np.ndarray, np.ndarray, float, np.ndarray, np.ndarray, np.ndarray]:
     """Compute chroma-cqt and aggregate per beat for chord inference.
     Returns (beat_synced_chroma, beat_frames, tempo, onset_envelope).
     """
     y = librosa.effects.harmonic(y)
     chroma = librosa.feature.chroma_cqt(y=y, sr=sr)
     mel = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=64)
+    # Fundamental frequency (bass) track (mono). Restrict to bass register.
+    try:
+        f0 = librosa.yin(y, fmin=50, fmax=220, sr=sr)
+    except Exception:
+        f0 = np.zeros(1, dtype=float)
     onset_env = librosa.onset.onset_strength(y=y, sr=sr)
     tempo, beats = librosa.beat.beat_track(y=y, sr=sr)
     if beats.size == 0:
@@ -442,10 +445,22 @@ def _compute_beatsynced_chroma(y: np.ndarray, sr: int) -> Tuple[np.ndarray, np.n
         # Approximate mel pooling
         mel_pools = [mel[:, i : i + window].mean(axis=1) for i in range(0, mel.shape[1], window)]
         mel_bs = np.stack(mel_pools, axis=1) if mel_pools else np.zeros((64, 1), dtype=float)
-        return np.stack(pools, axis=1), np.arange(len(pools)), 120.0, np.asarray(onset_pools, dtype=float), mel_bs
+        # Pool f0 roughly by selecting nearest sample per pooled frame (fallback zeros)
+        f0_pools = []
+        for i in range(0, len(onset_env), window):
+            idx = min(i, len(f0) - 1) if len(f0) > 0 else 0
+            f0_pools.append(float(f0[idx]) if len(f0) > 0 else 0.0)
+        return (
+            np.stack(pools, axis=1),
+            np.arange(len(pools)),
+            120.0,
+            np.asarray(onset_pools, dtype=float),
+            mel_bs,
+            np.asarray(f0_pools, dtype=float),
+        )
     beat_chroma = librosa.util.sync(chroma, beats, aggregate=np.mean)
-    # Keep mel at original frame-rate; we will sample it at beat frames
-    return beat_chroma, beats, float(tempo), onset_env, mel
+    # Keep mel and f0 at original frame-rate; we will sample them at beat frames
+    return beat_chroma, beats, float(tempo), onset_env, mel, f0
 
 
 def _estimate_key_from_chroma(chroma: np.ndarray) -> Tuple[str, str]:
@@ -779,6 +794,7 @@ def _auto_select_beats_per_bar(
     onset_env: np.ndarray,
     candidates: Tuple[int, ...] = (2, 3, 4),
     mel: Optional[np.ndarray] = None,
+    f0_seq: Optional[np.ndarray] = None,
     debug_dict: Optional[dict] = None,
 ) -> int:
     """Blend phrase repetition with rhythmic accent/chord-change alignment to pick the meter."""
@@ -885,6 +901,33 @@ def _auto_select_beats_per_bar(
     else:
         lf_scores = {n: 0.0 for n in candidates}
 
+    # Root-bass downbeat: sample f0 per beat, then fold by bar to see if bass notes emphasize bar starts
+    rootbass_scores: dict = {}
+    if isinstance(f0_seq, np.ndarray) and f0_seq.size > 0 and beat_frames.size > 0:
+        last_idx_f0 = f0_seq.shape[0] - 1
+        beat_f0: List[float] = []
+        for f in beat_frames:
+            idx = int(f)
+            if idx < 0:
+                idx = 0
+            if idx > last_idx_f0:
+                idx = last_idx_f0
+            beat_f0.append(float(f0_seq[idx]))
+        beat_f0 = np.asarray(beat_f0, dtype=float)
+        # Use voiced indicator (non-zero f0) as a proxy to avoid octave drift; measure voiced energy per position
+        voiced = (beat_f0 > 0).astype(float)
+        for n in candidates:
+            if n <= 0 or beat_f0.size == 0:
+                rootbass_scores[n] = 0.0
+                continue
+            pos = np.arange(len(beat_f0)) % n
+            v0 = voiced[pos == 0].mean() if np.any(pos == 0) else 0.0
+            vO = voiced[pos != 0].mean() if np.any(pos != 0) else 0.0
+            # Contrast of voiced probability at bar starts vs others
+            rootbass_scores[n] = float(max(v0 - vO, 0.0))
+    else:
+        rootbass_scores = {n: 0.0 for n in candidates}
+
     # Periodicity via autocorrelation at lag=n (compare 3-beat vs 2-beat strength)
     def _sample_onsets_per_beat(beat_frames_arr: np.ndarray, onset_env_arr: np.ndarray) -> np.ndarray:
         if onset_env_arr.ndim == 0 or beat_frames_arr.size == 0:
@@ -982,26 +1025,29 @@ def _auto_select_beats_per_bar(
     periodicity_n = normalize(periodicity_scores)
     runmult_n = normalize(runmult_scores)
     lf_n = normalize(lf_scores)
-    # Blend: accent (0.24) + homogeneity (0.22) + flux (0.16) + periodicity (0.12) + run-multiples (0.10) + low-bass (0.11) + phrase (0.05)
+    rb_n = normalize(rootbass_scores)
+    # Blend (loosen 3/4 gates): reduce homogeneity weight, raise periodicity weight
+    # New blend: phrase 0.05, accent 0.22, homogeneity 0.10, flux 0.15, periodicity 0.30, run-multiples 0.08, low-bass 0.10
     total_scores = {
         n: 0.05 * phrase_n.get(n, 0.0)
-        + 0.24 * accent_n.get(n, 0.0)
-        + 0.22 * homo_n.get(n, 0.0)
-        + 0.16 * flux_n.get(n, 0.0)
-        + 0.12 * periodicity_n.get(n, 0.0)
-        + 0.10 * runmult_n.get(n, 0.0)
-        + 0.11 * lf_n.get(n, 0.0)
+        + 0.22 * accent_n.get(n, 0.0)
+        + 0.10 * homo_n.get(n, 0.0)
+        + 0.15 * flux_n.get(n, 0.0)
+        + 0.30 * periodicity_n.get(n, 0.0)
+        + 0.08 * runmult_n.get(n, 0.0)
+        + 0.07 * lf_n.get(n, 0.0)
+        + 0.03 * rb_n.get(n, 0.0)
         for n in candidates
     }
 
     # Apply conservative gate for selecting 3/4: require strong bar-start change alignment
     if 3 in candidates and 3 in total_scores:
         align3 = _change_alignment_ratio(beat_chords, 3)
-        if align3 < 0.6:
-            total_scores[3] *= 0.6  # penalize if not enough 3-beat alignment
-        print(f"[DEBUG] 🥁 3/4 alignment ratio={align3:.2f} (>=0.60 required to avoid penalty)")
+        if align3 < 0.5:
+            total_scores[3] *= 0.8  # lighter penalty for weaker 3-beat alignment
+        print(f"[DEBUG] 🥁 3/4 alignment ratio={align3:.2f} (>=0.50 to avoid penalty)")
 
-    print(f"[DEBUG] 🥁 Meter scoring - phrase={phrase_scores}, accent={accent_scores}, homo={homo_scores}, flux={flux_scores}, periodicity={periodicity_scores}, runmult={runmult_scores}, lf={lf_scores}, total(pre)={total_scores}")
+    print(f"[DEBUG] 🥁 Meter scoring - phrase={phrase_scores}, accent={accent_scores}, homo={homo_scores}, flux={flux_scores}, periodicity={periodicity_scores}, runmult={runmult_scores}, lf={lf_scores}, rb={rootbass_scores}, total(pre)={total_scores}")
     if debug_dict is not None:
         debug_dict.update({
             "phrase": phrase_scores,
@@ -1011,19 +1057,20 @@ def _auto_select_beats_per_bar(
             "periodicity": periodicity_scores,
             "run_multiples": runmult_scores,
             "low_bass": lf_scores,
+            "root_bass": rootbass_scores,
         })
 
     # Require margin for 3/4 over others to reduce false positives
     if 3 in total_scores:
         best_other = max([v for k, v in total_scores.items() if k != 3] or [0.0])
-        # Additional periodicity gate: 3-beat periodicity should exceed 2-beat by a margin
+        # Additional periodicity gate (looser): 3-beat periodicity should be at least comparable to 2-beat
         p3 = periodicity_scores.get(3, 0.0)
         p2 = periodicity_scores.get(2, 0.0)
-        if p3 < p2 + 0.03:
-            total_scores[3] *= 0.9
-        # Require a small but real margin overall
-        if total_scores[3] < best_other + 0.03:
-            total_scores[3] *= 0.97
+        if p3 < p2 + 0.01:
+            total_scores[3] *= 0.95
+        # Remove strict margin requirement; only dampen slightly if very close
+        if total_scores[3] < best_other + 0.01:
+            total_scores[3] *= 0.99
 
     best_n = max(total_scores.items(), key=lambda kv: (kv[1], kv[0] == 4, kv[0] == 2))[0]
 
@@ -1038,7 +1085,7 @@ def _auto_select_beats_per_bar(
         flux2 = flux_scores.get(2, 0.0)
         flux3 = flux_scores.get(3, 0.0)
         # Require multiple cues to favor 3: stronger bar-start alignment and periodicity and not worse homogeneity
-        if (align3 - align2) > 0.15 and (per3 - per2) > 0.05 and (homo3 + 1e-6) >= (homo2 - 1e-6) and (flux3 + 1e-6) >= (flux2 - 1e-6):
+        if (align3 - align2) > 0.08 and (per3 - per2) > 0.02 and (homo3 + 1e-6) >= (homo2 - 1e-6) and (flux3 + 1e-6) >= (flux2 - 1e-6):
             print(f"[DEBUG] 🥁 Waltz override triggered: align3={align3:.2f} per3={per3:.2f} homo3={homo3:.2f} vs 2-beat align2={align2:.2f} per2={per2:.2f} homo2={homo2:.2f}")
             best_n = 3
         if debug_dict is not None:
