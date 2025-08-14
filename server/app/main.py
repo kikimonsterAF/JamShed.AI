@@ -325,7 +325,7 @@ def _analyze_path(
         beat_chords=beat_chords,
         beat_frames=beat_frames,
         onset_env=onset_env,
-        candidates=(2, 3, 4),
+        candidates=(2, 3, 4, 6),
         mel=mel,
         f0_seq=f0,
         beat_chroma=bass_chroma,
@@ -811,6 +811,7 @@ def _auto_select_beats_per_bar(
     candidates: Tuple[int, ...] = (2, 3, 4, 6),
     mel: Optional[np.ndarray] = None,
     f0_seq: Optional[np.ndarray] = None,
+    beat_chroma: Optional[np.ndarray] = None,
     debug_dict: Optional[dict] = None,
 ) -> int:
     """Blend phrase repetition with rhythmic accent/chord-change alignment to pick the meter."""
@@ -946,6 +947,25 @@ def _auto_select_beats_per_bar(
     else:
         rootbass_scores = {n: 0.0 for n in candidates}
 
+    # Bar-start root dominance using beat-synchronous chroma (default to 0 if unavailable)
+    barroot_scores: dict = {}
+    if isinstance(beat_chroma, np.ndarray) and beat_chroma.ndim == 2 and beat_chroma.shape[1] == len(beat_chords):
+        for n in candidates:
+            if n <= 0:
+                barroot_scores[n] = 0.0
+                continue
+            pos = np.arange(len(beat_chords)) % n
+            if not np.any(pos == 0) or not np.any(pos != 0):
+                barroot_scores[n] = 0.0
+                continue
+            c0 = beat_chroma[:, pos == 0].mean(axis=1)
+            cO = beat_chroma[:, pos != 0].mean(axis=1)
+            c0 = c0 / (c0.sum() + 1e-9)
+            cO = cO / (cO.sum() + 1e-9)
+            barroot_scores[n] = max(float(np.max(c0) - np.max(cO)), 0.0)
+    else:
+        barroot_scores = {n: 0.0 for n in candidates}
+
     # Periodicity via autocorrelation at lag=n (compare 3-beat vs 2-beat strength)
     def _sample_onsets_per_beat(beat_frames_arr: np.ndarray, onset_env_arr: np.ndarray) -> np.ndarray:
         if onset_env_arr.ndim == 0 or beat_frames_arr.size == 0:
@@ -1028,6 +1048,120 @@ def _auto_select_beats_per_bar(
         return mult / len(runs)
 
     runmult_scores = {n: _run_multiple_fraction(beat_chords, n) for n in candidates}
+
+    # Tempogram ratio score: compute tempogram and check if ratio at expected BPM favors n
+    def _compute_tempogram(onset_strength: np.ndarray, sr: int = 22050, hop_length: int = 512) -> np.ndarray:
+        """Compute tempogram using librosa."""
+        try:
+            tempogram = librosa.feature.tempogram(onset_envelope=onset_strength, sr=sr, hop_length=hop_length)
+            return tempogram
+        except Exception:
+            return np.zeros((1, 1), dtype=float)
+
+    def _score_tempogram_ratio(beat_frames_arr: np.ndarray, onset_env_arr: np.ndarray, n: int, tempo: float) -> float:
+        """Score based on tempogram ratio at expected BPM for meter n."""
+        if n <= 0 or beat_frames_arr.size == 0 or tempo <= 0:
+            return 0.0
+        try:
+            tempogram = _compute_tempogram(onset_env_arr)
+            if tempogram.size == 0:
+                print(f"[DEBUG] 🔧 Tempogram empty for meter {n}")
+                return 0.0
+            
+            # For 3/4 time, look for emphasis on dotted quarter note patterns
+            # Instead of tempo*n/4, use tempo/n for bar-level emphasis  
+            if n == 3:
+                # Waltz: look for emphasis at tempo/3 (measure-level pulse)
+                expected_bpm = tempo / 3.0
+            else:
+                # Other meters: look for emphasis at tempo/n 
+                expected_bpm = tempo / n
+            
+            # Find closest tempo bin in tempogram
+            tempo_bins = librosa.tempo_frequencies(len(tempogram), hop_length=512, sr=22050)
+            if len(tempo_bins) == 0:
+                return 0.0
+            
+            closest_idx = np.argmin(np.abs(tempo_bins - expected_bpm))
+            if closest_idx >= len(tempogram):
+                return 0.0
+                
+            # Get energy at this BPM across time
+            tempo_energy = tempogram[closest_idx, :].mean()
+            total_energy = tempogram.mean() + 1e-9
+            
+            score = float(tempo_energy / total_energy)
+            print(f"[DEBUG] 🔧 Tempogram n={n}: expected_bpm={expected_bpm:.1f}, score={score:.3f}")
+            return score
+        except Exception as e:
+            print(f"[DEBUG] 🔧 Tempogram error for meter {n}: {e}")
+            return 0.0
+
+    tempogram_scores: dict = {}
+    if onset_env.size > 0 and beat_frames.size > 0:
+        # Estimate tempo from beat_frames
+        if len(beat_frames) > 1:
+            beat_intervals = np.diff(beat_frames) * 512 / 22050  # Convert to seconds
+            avg_beat_interval = np.median(beat_intervals)
+            estimated_tempo = 60.0 / avg_beat_interval if avg_beat_interval > 0 else 120.0
+        else:
+            estimated_tempo = 120.0
+        
+        print(f"[DEBUG] 🔧 Estimated tempo: {estimated_tempo:.1f} BPM from {len(beat_frames)} beats")
+        for n in candidates:
+            tempogram_scores[n] = _score_tempogram_ratio(beat_frames, onset_env, n, estimated_tempo)
+    else:
+        tempogram_scores = {n: 0.0 for n in candidates}
+        print(f"[DEBUG] 🔧 No onset/beat data for tempogram")
+
+    # Simplified harmonic change periodicity score (instead of complex SSM)
+    def _score_harmonic_periodicity(chroma_matrix: np.ndarray, n: int) -> float:
+        """Score based on harmonic change periodicity at meter n."""
+        if n <= 0 or chroma_matrix.size == 0 or chroma_matrix.ndim != 2:
+            return 0.0
+        try:
+            # Compute harmonic change between adjacent beats
+            if chroma_matrix.shape[1] < 2:
+                return 0.0
+            
+            # Cosine distance between adjacent chroma vectors
+            harm_change = np.zeros(chroma_matrix.shape[1] - 1, dtype=float)
+            for i in range(chroma_matrix.shape[1] - 1):
+                c1 = chroma_matrix[:, i]
+                c2 = chroma_matrix[:, i + 1]
+                norm1 = np.linalg.norm(c1) + 1e-9
+                norm2 = np.linalg.norm(c2) + 1e-9
+                similarity = np.dot(c1, c2) / (norm1 * norm2)
+                harm_change[i] = 1.0 - similarity  # Convert similarity to change
+            
+            # Check for periodicity at lag n
+            if len(harm_change) < n + 2:
+                return 0.0
+                
+            # Autocorrelation at lag n
+            centered = harm_change - harm_change.mean()
+            if len(centered) < n:
+                return 0.0
+                
+            numerator = np.dot(centered[:-n], centered[n:])
+            denominator = np.dot(centered, centered) + 1e-9
+            
+            correlation = numerator / denominator
+            return float(max(correlation, 0.0))
+        except Exception as e:
+            print(f"[DEBUG] 🔧 Harmonic periodicity error: {e}")
+            return 0.0
+
+    harmonic_scores: dict = {}
+    if isinstance(beat_chroma, np.ndarray) and beat_chroma.size > 0:
+        print(f"[DEBUG] 🔧 Beat chroma shape: {beat_chroma.shape}")
+        for n in candidates:
+            harmonic_scores[n] = _score_harmonic_periodicity(beat_chroma, n)
+        print(f"[DEBUG] 🔧 Harmonic periodicity scores: {harmonic_scores}")
+    else:
+        harmonic_scores = {n: 0.0 for n in candidates}
+        print(f"[DEBUG] 🔧 No beat chroma available for harmonic periodicity")
+
     def normalize(d: dict) -> dict:
         vals = list(d.values())
         if not vals:
@@ -1044,17 +1178,22 @@ def _auto_select_beats_per_bar(
     runmult_n = normalize(runmult_scores)
     lf_n = normalize(lf_scores)
     rb_n = normalize(rootbass_scores)
-    # Blend (loosen 3/4 gates): reduce homogeneity weight, raise periodicity weight
-    # New blend: phrase 0.05, accent 0.22, homogeneity 0.10, flux 0.15, periodicity 0.30, run-multiples 0.08, low-bass 0.10
+    br_n = normalize(barroot_scores)
+    tempogram_n = normalize(tempogram_scores)
+    harmonic_n = normalize(harmonic_scores)
+    # Blend (ensemble): boost harmonic periodicity to 0.25 for waltz detection - final push
     total_scores = {
-        n: 0.05 * phrase_n.get(n, 0.0)
-        + 0.22 * accent_n.get(n, 0.0)
-        + 0.10 * homo_n.get(n, 0.0)
-        + 0.15 * flux_n.get(n, 0.0)
-        + 0.30 * periodicity_n.get(n, 0.0)
-        + 0.08 * runmult_n.get(n, 0.0)
-        + 0.07 * lf_n.get(n, 0.0)
-        + 0.03 * rb_n.get(n, 0.0)
+        n: 0.03 * phrase_n.get(n, 0.0)
+        + 0.14 * accent_n.get(n, 0.0)
+        + 0.04 * homo_n.get(n, 0.0)
+        + 0.07 * flux_n.get(n, 0.0)
+        + 0.14 * periodicity_n.get(n, 0.0)
+        + 0.03 * runmult_n.get(n, 0.0)
+        + 0.04 * lf_n.get(n, 0.0)
+        + 0.02 * rb_n.get(n, 0.0)
+        + 0.05 * br_n.get(n, 0.0)
+        + 0.07 * tempogram_n.get(n, 0.0)
+        + 0.25 * harmonic_n.get(n, 0.0)
         for n in candidates
     }
 
@@ -1065,7 +1204,7 @@ def _auto_select_beats_per_bar(
             total_scores[3] *= 0.8  # lighter penalty for weaker 3-beat alignment
         print(f"[DEBUG] 🥁 3/4 alignment ratio={align3:.2f} (>=0.50 to avoid penalty)")
 
-    print(f"[DEBUG] 🥁 Meter scoring - phrase={phrase_scores}, accent={accent_scores}, homo={homo_scores}, flux={flux_scores}, periodicity={periodicity_scores}, runmult={runmult_scores}, lf={lf_scores}, rb={rootbass_scores}, total(pre)={total_scores}")
+    print(f"[DEBUG] 🥁 Meter scoring - phrase={phrase_scores}, accent={accent_scores}, homo={homo_scores}, flux={flux_scores}, periodicity={periodicity_scores}, runmult={runmult_scores}, lf={lf_scores}, rb={rootbass_scores}, barroot={barroot_scores}, tempogram={tempogram_scores}, harmonic={harmonic_scores}, total(pre)={total_scores}")
     if debug_dict is not None:
         debug_dict.update({
             "phrase": phrase_scores,
@@ -1076,6 +1215,9 @@ def _auto_select_beats_per_bar(
             "run_multiples": runmult_scores,
             "low_bass": lf_scores,
             "root_bass": rootbass_scores,
+            "bar_root": barroot_scores,
+            "tempogram": tempogram_scores,
+            "harmonic": harmonic_scores,
         })
 
     # Require margin for 3/4 over others to reduce false positives
