@@ -56,6 +56,8 @@ class AnalysisResponse(BaseModel):
     beats_per_bar: Optional[int] = None
     meter: Optional[str] = None
     meter_debug: Optional[dict] = None
+    # Add key detection to the response
+    key: Optional[str] = None
 
 
 class UsageResponse(BaseModel):
@@ -385,6 +387,7 @@ def _analyze_path(
         beats_per_bar=selected_bpb,
         meter=meter_label,
         meter_debug=md,
+        key=f"{key_center} {key_mode}" if key_center and key_mode else None,
     )
 
 
